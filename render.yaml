@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: bcg-api
+    env: node
+    plan: free
+    region: oregon
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: SENDER_EMAIL
+        value: "BingoCardGen <no-reply@bingocardgen.com>"
+      - key: RESEND_API_KEY
+        sync: false
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
+      - key: UPSTASH_REDIS_REST_URL
+        sync: false
+      - key: UPSTASH_REDIS_REST_TOKEN
+        sync: false
+      - key: ENABLE_TEST_ROUTES
+        value: "0"
