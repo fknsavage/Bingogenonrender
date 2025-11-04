@@ -19,10 +19,12 @@ const ORIGIN_ALLOW = new Set([
 ]);
 
 // ---------- Redis (optional) ----------
-const USE_REDIS = !!(process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN);
-const redis = USE_REDIS
-  ? new Redis({ url: process.env.UPSTASH_REDIS_REST_URL, token: process.env.UPSTASH_REDIS_REST_TOKEN })
-  : null;
+const url = (process.env.UPSTASH_REDIS_REST_URL || "").trim().replace(/\/+$/, "");
+const token = (process.env.UPSTASH_REDIS_REST_TOKEN || "").trim();
+const USE_REDIS = !!(url && token);
+
+const { Redis } = require("@upstash/redis");
+const redis = USE_REDIS ? new Redis({ url, token }) : null;
 
 // Simple DB adapter: Redis if configured, otherwise in-memory Maps
 const mem = { SESSIONS: new Map(), USERS: new Map(), C2E: new Map(), OTP: new Map() };
