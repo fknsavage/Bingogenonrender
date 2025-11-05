@@ -97,8 +97,10 @@ app.set('trust proxy', 1);
 const ALLOW = new Set([
   'https://bingocardgen.com',
   'https://www.bingocardgen.com',
-  // allow any CF Pages preview if you use them:
-  // 'https://*.bingocardgen.pages.dev'  // (use a custom check for wildcard)
+  'https://api.bingocardgen.com',          // direct API calls
+  'https://bingogenonrender.onrender.com', // Render subdomain (fallback)
+  'http://localhost:5173',
+  'http://127.0.0.1:5173'
 ]);
 
 function originOk(origin) {
@@ -112,7 +114,6 @@ function originOk(origin) {
   } catch { return false; }
 }
 
-const cors = require('cors');
 app.use(cors({
   origin: (origin, cb) => originOk(origin) ? cb(null, true) : cb(new Error('CORS blocked')),
   credentials: true,
@@ -186,6 +187,9 @@ app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async
 
 // JSON parser for all other routes (must come after raw webhook)
 app.use(express.json());
+
+// ✅ parse cookies for session reads
+app.use(cookieParser(SESSION_SECRET));
 
 // ---------- Helpers ----------
 const randCode = () => String(Math.floor(100000 + Math.random() * 900000));
