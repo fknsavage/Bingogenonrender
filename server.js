@@ -4,7 +4,7 @@ const cors = require("cors");
 const cookieParser = require("cookie-parser");
 const crypto = require("crypto");
 const stripe = require("stripe")(process.env.STRIPE_API_KEY || "sk_test_dummy");
-const { Redis } = require("@upstash/redis");
+const UpstashRedis = require("@upstash/redis"); // ✅ import once
 
 // ---------- Config ----------
 const PORT = process.env.PORT || 10000;
@@ -19,12 +19,10 @@ const ORIGIN_ALLOW = new Set([
 ]);
 
 // ---------- Redis (optional) ----------
-const url = (process.env.UPSTASH_REDIS_REST_URL || "").trim().replace(/\/+$/, "");
+const url   = (process.env.UPSTASH_REDIS_REST_URL   || "").trim().replace(/\/+$/, "");
 const token = (process.env.UPSTASH_REDIS_REST_TOKEN || "").trim();
 const USE_REDIS = !!(url && token);
-
-const { Redis } = require("@upstash/redis");
-const redis = USE_REDIS ? new Redis({ url, token }) : null;
+const redis = USE_REDIS ? new UpstashRedis.Redis({ url, token }) : null; // ✅ single init
 
 // Simple DB adapter: Redis if configured, otherwise in-memory Maps
 const mem = { SESSIONS: new Map(), USERS: new Map(), C2E: new Map(), OTP: new Map() };
@@ -164,15 +162,18 @@ app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async
   }
 });
 
-// JSON parser for all other routes
+// JSON parser for all other routes (must come after raw webhook)
 app.use(express.json());
 
 // ---------- Helpers ----------
 const randCode = () => String(Math.floor(100000 + Math.random() * 900000));
 
 // ---------- Routes ----------
-app.get("/api/health", (req, res) => res.json({ ok: true, redis: !!redis, time: new Date().toISOString() }));
+app.get("/api/health", (req, res) =>
+  res.json({ ok: true, redis: !!redis, time: new Date().toISOString() })
+);
 
+// start OTP
 app.post("/api/auth/otp/start", async (req, res) => {
   try {
     const email = String(req.body?.email || "").trim().toLowerCase();
@@ -205,6 +206,7 @@ app.post("/api/auth/otp/start", async (req, res) => {
   } catch (e) { console.error(e); res.status(500).json({ ok: false, error: "server_error" }); }
 });
 
+// verify OTP
 app.post("/api/auth/otp/verify", async (req, res) => {
   const email = String(req.body?.email || "").trim().toLowerCase();
   const code = String(req.body?.code || "").trim();
@@ -222,6 +224,7 @@ app.post("/api/auth/otp/verify", async (req, res) => {
   res.json({ ok: true, user: { email, pro: !!u.pro } });
 });
 
+// session info
 app.get("/api/me", async (req, res) => {
   const sid = req.cookies?.sid || "";
   const email = await DB.readSessionSid(sid);
@@ -230,6 +233,7 @@ app.get("/api/me", async (req, res) => {
   res.json({ authed: true, email, pro: !!u.pro });
 });
 
+// logout
 app.post("/api/logout", async (req, res) => {
   const sid = req.cookies?.sid; if (sid) await DB.delSession(sid);
   res.clearCookie("sid", { httpOnly: true, sameSite: "lax", secure: true });
