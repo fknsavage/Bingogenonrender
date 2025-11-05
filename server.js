@@ -92,37 +92,31 @@ const DB = {
 // ---------- App ----------
 const app = express();
 
-// ✅ Expanded CORS (Render + CF Pages + local dev)
-const CANONICAL = new Set([
+// ---------- CORS / Cookies / Trust proxy ----------
+const cors = require('cors'); // make sure it's imported at top
+app.set('trust proxy', 1);    // trust Cloudflare/Render proxies
+
+// Allowed front-end origins
+const ALLOW = new Set([
   'https://bingocardgen.com',
   'https://www.bingocardgen.com',
-  'https://bingogenonrender.onrender.com',
+  'https://05029bdd.bingocardgen.pages.dev', // optional Cloudflare Pages preview
 ]);
 
-function originOk(origin) {
-  if (!origin) return true; // curl/native
-  try {
-    const u = new URL(origin);
-    const host = u.hostname;
-    if (CANONICAL.has(origin)) return true;
-    if (host === 'bingocardgen.com' || host === 'www.bingocardgen.com') return true;
-    if (host.endsWith('.bingocardgen.pages.dev')) return true; // ✅ any CF Pages preview
-    if (host === 'localhost' || host === '127.0.0.1') return true; // ✅ dev
-    return false;
-  } catch { return false; }
-}
-
 app.use(cors({
-  origin: (origin, cb) =>
-    originOk(origin)
-      ? cb(null, true)
-      : cb(new Error('CORS blocked: ' + origin)),
-  credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization']
+  origin: (origin, cb) => {
+    if (!origin) return cb(null, true); // allow curl, local tests, health
+    if (ALLOW.has(origin)) return cb(null, true);
+    console.warn('❌ CORS blocked:', origin);
+    return cb(new Error('Not allowed by CORS'));
+  },
+  credentials: true, // allow cookies / sessions
+  methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
+  allowedHeaders: ['Content-Type','Authorization']
 }));
 
-app.use(cookieParser(SESSION_SECRET));
+// Preflight handler for browsers
+app.options('*', cors());
 
 // ---------- Stripe webhook (RAW body) ----------
 app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async (req, res) => {
