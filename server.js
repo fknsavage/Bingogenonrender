@@ -92,35 +92,34 @@ const DB = {
 // ---------- App ----------
 const app = express();
 
-// ---------- CORS / Cookies / Trust proxy ----------
-app.set("trust proxy", 1); // trust Cloudflare/Render proxies for secure cookies
+app.set('trust proxy', 1);
 
 const ALLOW = new Set([
-  "https://bingocardgen.com",
-  "https://www.bingocardgen.com",
-  "https://05029bdd.bingocardgen.pages.dev", // Cloudflare Pages preview (optional)
+  'https://bingocardgen.com',
+  'https://www.bingocardgen.com',
+  // allow any CF Pages preview if you use them:
+  // 'https://*.bingocardgen.pages.dev'  // (use a custom check for wildcard)
 ]);
 
-app.use(cors({
-  origin: (origin, cb) => {
-    if (!origin) return cb(null, true);                // allow curl/health/no-origin
-    if (ALLOW.has(origin)) return cb(null, true);
-    // allow any CF Pages preview subdomain or localhost
-    try {
-      const { hostname } = new URL(origin);
-      if (hostname.endsWith(".bingocardgen.pages.dev")) return cb(null, true);
-      if (hostname === "localhost" || hostname === "127.0.0.1") return cb(null, true);
-    } catch {}
-    console.warn("❌ CORS blocked:", origin);
-    return cb(new Error("Not allowed by CORS"));
-  },
-  credentials: true,
-  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"]
-}));
+function originOk(origin) {
+  if (!origin) return true;
+  try {
+    const u = new URL(origin);
+    const host = u.hostname;
+    if (ALLOW.has(origin)) return true;
+    if (host.endsWith('.bingocardgen.pages.dev')) return true;
+    return false;
+  } catch { return false; }
+}
 
-// Preflight handler
-app.options("*", cors());
+const cors = require('cors');
+app.use(cors({
+  origin: (origin, cb) => originOk(origin) ? cb(null, true) : cb(new Error('CORS blocked')),
+  credentials: true,
+  methods: ['GET','POST','OPTIONS'],
+  allowedHeaders: ['Content-Type','Authorization'],
+}));
+app.options('*', cors());
 
 // ---------- Stripe webhook (RAW body) ----------
 app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async (req, res) => {
