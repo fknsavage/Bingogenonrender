@@ -92,35 +92,39 @@ const DB = {
 // ---------- App ----------
 const app = express();
 
+// ---- CORS (single, robust block) ----
 app.set('trust proxy', 1);
 
 const ALLOW = new Set([
   'https://bingocardgen.com',
   'https://www.bingocardgen.com',
-  'https://api.bingocardgen.com',          // direct API calls
-  'https://bingogenonrender.onrender.com', // Render subdomain (fallback)
-  'http://localhost:5173',
-  'http://127.0.0.1:5173'
+  'https://api.bingocardgen.com',            // direct API access
+  'https://bingogenonrender.onrender.com',   // Render fallback
 ]);
 
-function originOk(origin) {
-  if (!origin) return true;
+function isAllowed(origin) {
+  if (!origin) return true; // curl/health/native apps
   try {
     const u = new URL(origin);
-    const host = u.hostname;
     if (ALLOW.has(origin)) return true;
-    if (host.endsWith('.bingocardgen.pages.dev')) return true;
-    return false;
-  } catch { return false; }
+    // allow any CF Pages preview if you ever preview there
+    if (u.hostname.endsWith('.bingocardgen.pages.dev')) return true;
+  } catch (_) {}
+  return false;
 }
 
-app.use(cors({
-  origin: (origin, cb) => originOk(origin) ? cb(null, true) : cb(new Error('CORS blocked')),
-  credentials: true,
-  methods: ['GET','POST','OPTIONS'],
-  allowedHeaders: ['Content-Type','Authorization'],
-}));
-app.options('*', cors());
+app.use((req, res, next) => {
+  const origin = req.headers.origin || '';
+  if (isAllowed(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin || 'https://bingocardgen.com');
+    res.setHeader('Vary', 'Origin');  // <-- key for proxies/CDNs
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  }
+  if (req.method === 'OPTIONS') return res.status(204).end();
+  next();
+});
 
 // ---------- Stripe webhook (RAW body) ----------
 app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async (req, res) => {
