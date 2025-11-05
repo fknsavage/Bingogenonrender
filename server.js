@@ -91,12 +91,37 @@ const DB = {
 
 // ---------- App ----------
 const app = express();
-app.use(
-  cors({
-    origin: (origin, cb) => (!origin || ORIGIN_ALLOW.has(origin) ? cb(null, true) : cb(null, false)),
-    credentials: true,
-  })
-);
+
+// ✅ Expanded CORS (Render + CF Pages + local dev)
+const CANONICAL = new Set([
+  'https://bingocardgen.com',
+  'https://www.bingocardgen.com',
+  'https://bingogenonrender.onrender.com',
+]);
+
+function originOk(origin) {
+  if (!origin) return true; // curl/native
+  try {
+    const u = new URL(origin);
+    const host = u.hostname;
+    if (CANONICAL.has(origin)) return true;
+    if (host === 'bingocardgen.com' || host === 'www.bingocardgen.com') return true;
+    if (host.endsWith('.bingocardgen.pages.dev')) return true; // ✅ any CF Pages preview
+    if (host === 'localhost' || host === '127.0.0.1') return true; // ✅ dev
+    return false;
+  } catch { return false; }
+}
+
+app.use(cors({
+  origin: (origin, cb) =>
+    originOk(origin)
+      ? cb(null, true)
+      : cb(new Error('CORS blocked: ' + origin)),
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
+
 app.use(cookieParser(SESSION_SECRET));
 
 // ---------- Stripe webhook (RAW body) ----------
