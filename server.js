@@ -203,19 +203,35 @@ app.get("/api/health", (_req, res) =>
   res.json({ ok: true, redis: !!redis, time: new Date().toISOString() })
 );
 
-// start OTP
+// start OTP (with anti-double-send throttle)
 app.post("/api/auth/otp/start", async (req, res) => {
   try {
     const email = String(req.body?.email || "").trim().toLowerCase();
     if (!email || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email))
       return res.status(400).json({ ok: false, error: "bad_email" });
 
-    const code = randCode();
-    await DB.setOTP(email, code, 300);
+    // --- prevent double send (reuse same code if clicked twice quickly) ---
+    const throttleKey = `OTP:SENT:${email}`;
+    const recent = redis ? await redis.get(throttleKey) : mem.OTP.get(throttleKey);
+    let code;
 
+    if (recent) {
+      // already sent recently — reuse current code
+      code = await DB.getOTP(email);
+      console.log(`⏱️ Reusing OTP for ${email}: ${code}`);
+    } else {
+      // generate new code
+      code = randCode();
+      await DB.setOTP(email, code, 300); // 5 min expiry
+      if (redis) await redis.set(throttleKey, "1", { ex: 20 }); // throttle 20 sec
+      else mem.OTP.set(throttleKey, { code: 1, exp: Date.now() + 20000 });
+    }
+
+    // ensure user record exists
     const u = (await DB.getUser(email)) || { createdAt: Date.now(), pro: false };
     await DB.setUser(email, u);
 
+    // if resend not configured, just log for dev
     if (!RESEND_API_KEY) {
       console.log("🔐 OTP for", email, "=>", code);
       return res.json({ ok: true, sent: "log" });
@@ -233,6 +249,7 @@ app.post("/api/auth/otp/start", async (req, res) => {
       headers: { Authorization: `Bearer ${RESEND_API_KEY}`, "Content-Type": "application/json" },
       body: JSON.stringify({ from: SENDER_EMAIL, to: [email], subject: "Your BingoCardGen sign-in code", html }),
     });
+
     if (!resp.ok) {
       console.error("Resend send failed:", await resp.text());
       return res.status(500).json({ ok: false, error: "send_failed" });
@@ -240,7 +257,7 @@ app.post("/api/auth/otp/start", async (req, res) => {
 
     res.json({ ok: true, sent: "email" });
   } catch (e) {
-    console.error(e);
+    console.error("❌ OTP start error:", e);
     res.status(500).json({ ok: false, error: "server_error" });
   }
 });
