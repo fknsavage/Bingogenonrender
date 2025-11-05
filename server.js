@@ -1,10 +1,15 @@
 // server.js — Render + Resend + Stripe + (optional) Upstash Redis persistence
+
 const express = require("express");
 const cors = require("cors");
 const cookieParser = require("cookie-parser");
 const crypto = require("crypto");
 const stripe = require("stripe")(process.env.STRIPE_API_KEY || "sk_test_dummy");
-const UpstashRedis = require("@upstash/redis"); // ✅ import once
+const { Redis } = require("@upstash/redis"); // ✅ correct CJS import for Upstash
+
+// ---------- Crash visibility (helpful on Render) ----------
+process.on("unhandledRejection", (r) => console.error("🚨 UnhandledRejection:", r));
+process.on("uncaughtException", (e) => console.error("🚨 UncaughtException:", e));
 
 // ---------- Config ----------
 const PORT = process.env.PORT || 10000;
@@ -12,17 +17,12 @@ const SESSION_SECRET = process.env.SESSION_SECRET || "dev-secret-change-me";
 const SENDER_EMAIL = process.env.SENDER_EMAIL || "BingoCardGen <no-reply@bingocardgen.com>";
 const RESEND_API_KEY = process.env.RESEND_API_KEY || "";
 const ENABLE_TEST_ROUTES = process.env.ENABLE_TEST_ROUTES === "1";
-const ORIGIN_ALLOW = new Set([
-  "https://bingocardgen.com",
-  "https://www.bingocardgen.com",
-  "https://bingogenonrender.onrender.com",
-]);
 
 // ---------- Redis (optional) ----------
 const url   = (process.env.UPSTASH_REDIS_REST_URL   || "").trim().replace(/\/+$/, "");
 const token = (process.env.UPSTASH_REDIS_REST_TOKEN || "").trim();
 const USE_REDIS = !!(url && token);
-const redis = USE_REDIS ? new UpstashRedis.Redis({ url, token }) : null; // ✅ single init
+const redis = USE_REDIS ? new Redis({ url, token }) : null; // ✅ single init
 
 // Simple DB adapter: Redis if configured, otherwise in-memory Maps
 const mem = { SESSIONS: new Map(), USERS: new Map(), C2E: new Map(), OTP: new Map() };
@@ -93,30 +93,34 @@ const DB = {
 const app = express();
 
 // ---------- CORS / Cookies / Trust proxy ----------
-const cors = require('cors'); // make sure it's imported at top
-app.set('trust proxy', 1);    // trust Cloudflare/Render proxies
+app.set("trust proxy", 1); // trust Cloudflare/Render proxies for secure cookies
 
-// Allowed front-end origins
 const ALLOW = new Set([
-  'https://bingocardgen.com',
-  'https://www.bingocardgen.com',
-  'https://05029bdd.bingocardgen.pages.dev', // optional Cloudflare Pages preview
+  "https://bingocardgen.com",
+  "https://www.bingocardgen.com",
+  "https://05029bdd.bingocardgen.pages.dev", // Cloudflare Pages preview (optional)
 ]);
 
 app.use(cors({
   origin: (origin, cb) => {
-    if (!origin) return cb(null, true); // allow curl, local tests, health
+    if (!origin) return cb(null, true);                // allow curl/health/no-origin
     if (ALLOW.has(origin)) return cb(null, true);
-    console.warn('❌ CORS blocked:', origin);
-    return cb(new Error('Not allowed by CORS'));
+    // allow any CF Pages preview subdomain or localhost
+    try {
+      const { hostname } = new URL(origin);
+      if (hostname.endsWith(".bingocardgen.pages.dev")) return cb(null, true);
+      if (hostname === "localhost" || hostname === "127.0.0.1") return cb(null, true);
+    } catch {}
+    console.warn("❌ CORS blocked:", origin);
+    return cb(new Error("Not allowed by CORS"));
   },
-  credentials: true, // allow cookies / sessions
-  methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
-  allowedHeaders: ['Content-Type','Authorization']
+  credentials: true,
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"]
 }));
 
-// Preflight handler for browsers
-app.options('*', cors());
+// Preflight handler
+app.options("*", cors());
 
 // ---------- Stripe webhook (RAW body) ----------
 app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async (req, res) => {
@@ -188,7 +192,7 @@ app.use(express.json());
 const randCode = () => String(Math.floor(100000 + Math.random() * 900000));
 
 // ---------- Routes ----------
-app.get("/api/health", (req, res) =>
+app.get("/api/health", (_req, res) =>
   res.json({ ok: true, redis: !!redis, time: new Date().toISOString() })
 );
 
@@ -205,7 +209,10 @@ app.post("/api/auth/otp/start", async (req, res) => {
     const u = (await DB.getUser(email)) || { createdAt: Date.now(), pro: false };
     await DB.setUser(email, u);
 
-    if (!RESEND_API_KEY) { console.log("🔐 OTP for", email, "=>", code); return res.json({ ok: true, sent: "log" }); }
+    if (!RESEND_API_KEY) {
+      console.log("🔐 OTP for", email, "=>", code);
+      return res.json({ ok: true, sent: "log" });
+    }
 
     const html = `
       <div style="font-family:system-ui,Arial,sans-serif;padding:18px;background:#0b1220;color:#eafaff;border-radius:12px">
@@ -219,10 +226,16 @@ app.post("/api/auth/otp/start", async (req, res) => {
       headers: { Authorization: `Bearer ${RESEND_API_KEY}`, "Content-Type": "application/json" },
       body: JSON.stringify({ from: SENDER_EMAIL, to: [email], subject: "Your BingoCardGen sign-in code", html }),
     });
-    if (!resp.ok) { console.error("Resend send failed:", await resp.text()); return res.status(500).json({ ok: false, error: "send_failed" }); }
+    if (!resp.ok) {
+      console.error("Resend send failed:", await resp.text());
+      return res.status(500).json({ ok: false, error: "send_failed" });
+    }
 
     res.json({ ok: true, sent: "email" });
-  } catch (e) { console.error(e); res.status(500).json({ ok: false, error: "server_error" }); }
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ ok: false, error: "server_error" });
+  }
 });
 
 // verify OTP
