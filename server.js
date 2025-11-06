@@ -366,6 +366,19 @@ if (ENABLE_TEST_ROUTES) {
   app.all("/api/test-email", (_req, res) => res.status(404).send("Not found"));
 }
 
+// --- Debug: verify Stripe connectivity (safe; returns only acct id) ---
+if (ENABLE_TEST_ROUTES) {
+  app.get('/api/debug/stripe', async (_req, res) => {
+    try {
+      const acct = await stripe.accounts.retrieve();
+      res.json({ ok: true, account: acct.id });
+    } catch (e) {
+      console.error('Stripe debug error:', e);
+      res.status(500).json({ ok: false, error: e.message });
+    }
+  });
+}
+
 // ---------- Stripe Checkout ----------
 app.post("/api/stripe/create-checkout", async (req, res) => {
   try {
