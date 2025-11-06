@@ -363,6 +363,43 @@ if (ENABLE_TEST_ROUTES) {
   app.all("/api/test-email", (_req, res) => res.status(404).send("Not found"));
 }
 
+// ---------- Stripe Checkout ----------
+app.post("/api/stripe/create-checkout", async (req, res) => {
+  try {
+    const sid = req.cookies?.sid;
+    const email = sid ? await DB.readSessionSid(sid) : (req.body?.email || "").trim().toLowerCase();
+    if (!email) return res.status(400).json({ ok: false, error: "unauthenticated" });
+
+    const u = (await DB.getUser(email)) || { createdAt: Date.now(), pro: false };
+    const domain = "https://bingocardgen.com"; // change if staging
+
+    const session = await stripe.checkout.sessions.create({
+      mode: "subscription",
+      payment_method_types: ["card"],
+      customer_email: email,
+      line_items: [
+        {
+          price_data: {
+            currency: "usd",
+            product_data: { name: "BingoCardGen PRO" },
+            unit_amount: 1099, // $10.99
+            recurring: { interval: "month" }
+          },
+          quantity: 1
+        }
+      ],
+      success_url: `${domain}/?pro=success`,
+      cancel_url: `${domain}/?pro=cancel`
+    });
+
+    console.log("✅ Stripe session created:", email, session.id);
+    return res.json({ ok: true, url: session.url });
+  } catch (e) {
+    console.error("❌ Stripe create-checkout error:", e);
+    res.status(500).json({ ok: false, error: "server_error" });
+  }
+});
+
 // ---------- Start ----------
 app.listen(PORT, () => {
   console.log(`BCG API listening on ${PORT} | Redis: ${USE_REDIS ? "ON" : "OFF"}`);
