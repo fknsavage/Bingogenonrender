@@ -390,23 +390,28 @@ app.post("/api/stripe/create-checkout", async (req, res) => {
     const domain = "https://bingocardgen.com"; // change if staging
 
     const session = await stripe.checkout.sessions.create({
-      mode: "subscription",
-      payment_method_types: ["card"],
-      customer_email: email,
-      line_items: [
-        {
-          price_data: {
-            currency: "usd",
-            product_data: { name: "BingoCardGen PRO" },
-            unit_amount: 1099, // $10.99
-            recurring: { interval: "month" }
-          },
-          quantity: 1
-        }
-      ],
-      success_url: `${domain}/?pro=success`,
-      cancel_url: `${domain}/?pro=cancel`
-    });
+  mode: "subscription",
+  payment_method_types: ["card"],
+  customer_email: email,
+  allow_promotion_codes: true, // enable coupon field
+  line_items: [
+    {
+      price_data: {
+        currency: "cad", // 🇨🇦
+        product_data: {
+          name: "BingoCardGen PRO",
+          description: "Unlimited themes, multipliers, ad-free printing, and batch tools. Billed monthly in Canadian dollars (CA$10.99).",
+          images: ["https://bingocardgen.com/assets/logo-mini.png"]
+        },
+        unit_amount: 1099,
+        recurring: { interval: "month" }
+      },
+      quantity: 1
+    }
+  ],
+  success_url: `${domain}/?pro=success`,
+  cancel_url: `${domain}/?pro=cancel`
+});
 
     console.log("✅ Stripe session created:", email, session.id);
     return res.json({ ok: true, url: session.url });
