@@ -4,7 +4,10 @@ const express = require("express");
 const cors = require("cors");
 const cookieParser = require("cookie-parser");
 const crypto = require("crypto");
-const stripe = require("stripe")(process.env.STRIPE_API_KEY || "sk_test_dummy");
+// --- Stripe init ---
+const RAW_KEY = (process.env.STRIPE_API_KEY || "").trim();
+const CLEAN_KEY = RAW_KEY.replace(/[\r\n\t\s]+/g, "");
+const stripe = require("stripe")(CLEAN_KEY || "sk_test_dummy");
 const { Redis } = require("@upstash/redis"); // ✅ correct CJS import for Upstash
 
 // ---------- Crash visibility (helpful on Render) ----------
