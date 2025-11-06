@@ -276,23 +276,49 @@ app.post("/api/auth/otp/start", async (req, res) => {
   }
 });
 
-
-// verify OTP
+// verify OTP (instrumented + string-compare hardening)
 app.post("/api/auth/otp/verify", async (req, res) => {
-  const email = String(req.body?.email || "").trim().toLowerCase();
-  const code = String(req.body?.code || "").trim();
-  const stored = await DB.getOTP(email);
-  if (!stored) return res.status(400).json({ ok: false, error: "expired_or_missing" });
-  if (stored !== code) return res.status(400).json({ ok: false, error: "invalid_code" });
+  try {
+    const email = String(req.body?.email || "").trim().toLowerCase();
+    const code  = String(req.body?.code  || "").trim();
 
-  await DB.delOTP(email);
+    if (!email || !code) {
+      console.warn("VERIFY missing_fields", { email, codeLen: code.length });
+      return res.status(400).json({ ok: false, error: "missing_fields" });
+    }
 
-  const sid = await DB.newSession(email);
-  res.cookie("sid", sid, { httpOnly: true, sameSite: "lax", secure: true, maxAge: 14 * 24 * 3600 * 1000 });
+    const stored = await DB.getOTP(email);
+    console.log("VERIFY attempt", { email, code, stored });
 
-  const u = (await DB.getUser(email)) || { createdAt: Date.now(), pro: false };
-  await DB.setUser(email, u);
-  res.json({ ok: true, user: { email, pro: !!u.pro } });
+    if (!stored) {
+      console.warn("VERIFY expired_or_missing", { email });
+      return res.status(400).json({ ok: false, error: "expired_or_missing" });
+    }
+
+    if (String(stored).trim() !== code) {
+      console.warn("VERIFY invalid_code", { email, code, stored: String(stored).trim() });
+      return res.status(400).json({ ok: false, error: "invalid_code" });
+    }
+
+    await DB.delOTP(email);
+
+    const sid = await DB.newSession(email);
+    res.cookie("sid", sid, {
+      httpOnly: true,
+      sameSite: "lax",
+      secure: true,
+      maxAge: 14 * 24 * 3600 * 1000
+    });
+
+    const u = (await DB.getUser(email)) || { createdAt: Date.now(), pro: false };
+    await DB.setUser(email, u);
+
+    console.log("VERIFY success", { email, pro: !!u.pro });
+    return res.json({ ok: true, user: { email, pro: !!u.pro } });
+  } catch (e) {
+    console.error("❌ OTP verify error:", e);
+    return res.status(500).json({ ok: false, error: "server_error" });
+  }
 });
 
 // session info
