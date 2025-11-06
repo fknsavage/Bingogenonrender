@@ -204,32 +204,46 @@ app.get("/api/health", (_req, res) =>
 );
 
 // start OTP (with anti-double-send throttle)
+// server.js
 app.post("/api/auth/otp/start", async (req, res) => {
   try {
     const email = String(req.body?.email || "").trim().toLowerCase();
     if (!email || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email))
       return res.status(400).json({ ok: false, error: "bad_email" });
 
-    // --- prevent double send (reuse same code if clicked twice quickly) ---
-    const throttleKey = `OTP:SENT:${email}`;
-    const recent = redis ? await redis.get(throttleKey) : mem.OTP.get(throttleKey);
-    let code;
+    // --- New Logic [START] ---
+    // 1. Check if a valid code *already exists*
+    let code = await DB.getOTP(email);
 
-    if (recent) {
-      // already sent recently — reuse current code
-      code = await DB.getOTP(email);
-      console.log(`⏱️ Reusing OTP for ${email}: ${code}`);
+    if (code) {
+      // A valid code exists, reuse it.
+      console.log(`⏱️ Reusing existing valid OTP for ${email}: ${code}`);
     } else {
-      // generate new code
+      // No valid code, generate one.
       code = randCode();
       await DB.setOTP(email, code, 300); // 5 min expiry
-      if (redis) await redis.set(throttleKey, "1", { ex: 20 }); // throttle 20 sec
-      else mem.OTP.set(throttleKey, { code: 1, exp: Date.now() + 20000 });
+      console.log(`✅ Generated new OTP for ${email}: ${code}`);
     }
-
-    // ensure user record exists
+    
+    // ensure user record exists (moved up)
     const u = (await DB.getUser(email)) || { createdAt: Date.now(), pro: false };
     await DB.setUser(email, u);
+
+    // 2. Now, *separately*, check if we're allowed to *send* an email
+    const throttleKey = `OTP:SENT:${email}`;
+    const recent = redis ? await redis.get(throttleKey) : mem.OTP.get(throttleKey);
+
+    // If we've sent recently, just return "OK" but don't send another email
+    // We check for RESEND_API_KEY here so it works in dev
+    if (recent && RESEND_API_KEY) {
+      console.log(`⏱️ Email send throttled for ${email}`);
+      return res.json({ ok: true, sent: "throttled" });
+    }
+
+    // 3. If not throttled, set the throttle *now* and send the email
+    if (redis) await redis.set(throttleKey, "1", { ex: 20 }); // throttle 20 sec
+    else mem.OTP.set(throttleKey, { code: 1, exp: Date.now() + 20000 });
+    // --- New Logic [END] ---
 
     // if resend not configured, just log for dev
     if (!RESEND_API_KEY) {
@@ -261,6 +275,7 @@ app.post("/api/auth/otp/start", async (req, res) => {
     res.status(500).json({ ok: false, error: "server_error" });
   }
 });
+
 
 // verify OTP
 app.post("/api/auth/otp/verify", async (req, res) => {
