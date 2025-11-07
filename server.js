@@ -28,7 +28,8 @@ const USE_REDIS = !!(url && token);
 const redis = USE_REDIS ? new Redis({ url, token }) : null; // ✅ single init
 
 // Simple DB adapter: Redis if configured, otherwise in-memory Maps
-const mem = { SESSIONS: new Map(), USERS: new Map(), C2E: new Map(), OTP: new Map() };
+const mem = { SESSIONS: new Map(), USERS: new Map(), C2E: new Map(), OTP: new Map(), PENDING: new Map() };
+
 const DB = {
   // USERS
   async getUser(email) {
@@ -89,6 +90,32 @@ const DB = {
   },
   async delSession(sid) {
     if (redis) await redis.del(`SID:${sid}`); else mem.SESSIONS.delete(sid);
+  },
+
+  // --- Pending Stripe checkout session <-> email (24h TTL) ---
+  async setPending(sessionId, email) {
+    if (!sessionId || !email) return;
+    if (redis) await redis.set(`PENDING:${sessionId}`, email, { ex: 24 * 3600 });
+    else mem.PENDING.set(sessionId, { email, exp: Date.now() + 24 * 3600 * 1000 });
+  },
+  async getPending(sessionId) {
+    if (redis) return await redis.get(`PENDING:${sessionId}`);
+    const rec = mem.PENDING.get(sessionId);
+    if (!rec) return null;
+    if (rec.exp < Date.now()) { mem.PENDING.delete(sessionId); return null; }
+    return rec.email;
+  },
+  async delPending(sessionId) {
+    if (redis) await redis.del(`PENDING:${sessionId}`); else mem.PENDING.delete(sessionId);
+  },
+
+  // Safe PRO toggle helper
+  async setPro(email, on, customerId) {
+    const key = (email || "").toLowerCase(); if (!key) return;
+    const u = (await DB.getUser(key)) || { createdAt: Date.now(), pro: false };
+    u.pro = !!on;
+    if (customerId) u.stripe_customer = customerId;
+    await DB.setUser(key, u);
   }
 };
 
@@ -382,42 +409,100 @@ if (ENABLE_TEST_ROUTES) {
 // ---------- Stripe Checkout ----------
 app.post("/api/stripe/create-checkout", async (req, res) => {
   try {
-    const sid = req.cookies?.sid;
-    const email = sid ? await DB.readSessionSid(sid) : (req.body?.email || "").trim().toLowerCase();
-    if (!email) return res.status(400).json({ ok: false, error: "unauthenticated" });
+    const sid   = req.cookies?.sid;
+    const email = sid ? await DB.readSessionSid(sid)
+                      : (req.body?.email || "").trim().toLowerCase();
+    if (!email) return res.status(400).json({ ok:false, error:"unauthenticated" });
 
+    // make sure user exists (handy for mapping customer later)
     const u = (await DB.getUser(email)) || { createdAt: Date.now(), pro: false };
-    const domain = "https://bingocardgen.com"; // change if staging
+    await DB.setUser(email, u);
+
+    const domain = "https://bingocardgen.com";
 
     const session = await stripe.checkout.sessions.create({
-  mode: "subscription",
-  payment_method_types: ["card"],
-  customer_email: email,
-  allow_promotion_codes: true, // enable coupon field
-  line_items: [
-    {
-      price_data: {
-        currency: "cad", // 🇨🇦
-        product_data: {
-          name: "BingoCardGen PRO",
-          description: "Unlimited themes, multipliers, ad-free printing, and batch tools. Billed monthly in Canadian dollars (CA$10.99).",
-          images: ["https://bingocardgen.com/assets/logo-mini.png"]
-        },
-        unit_amount: 1099,
-        recurring: { interval: "month" }
-      },
-      quantity: 1
-    }
-  ],
-  success_url: `${domain}/?pro=success`,
-  cancel_url: `${domain}/?pro=cancel`
-});
+      mode: "subscription",
+      payment_method_types: ["card"],
+      customer_email: email,
+      allow_promotion_codes: true,        // enables coupon field
+      line_items: [
+        {
+          price_data: {
+            currency: "cad",
+            product_data: {
+              name: "BingoCardGen PRO",
+              description: "Unlimited themes, multipliers, ad-free printing, and batch tools. Billed monthly in Canadian dollars (CA$10.99).",
+              images: ["https://bingocardgen.com/assets/logo-mini.png"] // absolute https
+            },
+            unit_amount: 1099,
+            recurring: { interval: "month" }
+          },
+          quantity: 1
+        }
+      ],
+      // Stripe will inject the real session id
+      success_url: `${domain}/?pro=success&sid={CHECKOUT_SESSION_ID}`,
+      cancel_url:  `${domain}/?pro=cancel&sid={CHECKOUT_SESSION_ID}`,
+      metadata: { email }
+    });
+
+    // Track pending so we can reconcile if webhook is slow
+    await DB.setPending(session.id, email);
 
     console.log("✅ Stripe session created:", email, session.id);
-    return res.json({ ok: true, url: session.url });
+    return res.json({ ok:true, url: session.url });
   } catch (e) {
     console.error("❌ Stripe create-checkout error:", e);
-    res.status(500).json({ ok: false, error: "server_error" });
+    return res.status(500).json({ ok:false, error:"server_error" });
+  }
+});
+
+// 👇 Track the pending checkout so we can reconcile even if the webhook is delayed
+await DB.setPending(session.id, email);
+
+console.log("✅ Stripe session created:", email, session.id);
+return res.json({ ok: true, url: session.url });
+
+// Create a Stripe Billing Portal session
+app.post("/api/stripe/portal", async (req, res) => {
+  try {
+    const sid = req.cookies?.sid;
+    const email = sid && await DB.readSessionSid(sid);
+    if (!email) return res.status(401).json({ ok:false, error:"unauthenticated" });
+
+    const u = await DB.getUser(email);
+    if (!u?.stripe_customer) return res.status(400).json({ ok:false, error:"no_customer" });
+
+    const portal = await stripe.billingPortal.sessions.create({
+      customer: u.stripe_customer,
+      return_url: "https://bingocardgen.com"
+    });
+    res.json({ ok:true, url: portal.url });
+  } catch (e) {
+    console.error("portal error:", e);
+    res.status(500).json({ ok:false, error:"server_error" });
+  }
+});
+
+// Force-check subscription state from Stripe (support tool)
+app.post("/api/stripe/refresh-pro", async (req, res) => {
+  try {
+    const { email } = req.body || {};
+    const key = (email || "").toLowerCase();
+    if (!key) return res.status(400).json({ ok:false, error:"bad_email" });
+
+    const u = await DB.getUser(key);
+    if (!u?.stripe_customer) return res.json({ ok:true, updated:false, pro: !!u?.pro });
+
+    const subs = await stripe.subscriptions.list({ customer: u.stripe_customer, status: "all", limit: 1 });
+    const sub = subs.data[0];
+    const active = !!sub && ["active","trialing","past_due"].includes(sub.status);
+    u.pro = active;
+    await DB.setUser(key, u);
+    res.json({ ok:true, updated:true, pro: u.pro, status: sub?.status || "none" });
+  } catch (e) {
+    console.error("refresh-pro error:", e);
+    res.status(500).json({ ok:false, error:"server_error" });
   }
 });
 
