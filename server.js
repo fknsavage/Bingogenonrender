@@ -371,36 +371,72 @@ app.post("/api/logout", async (req, res) => {
 if (ENABLE_TEST_ROUTES) {
   app.all("/api/test-email", async (req, res) => {
     const method = req.method.toUpperCase();
-    const email = method === "GET" ? (req.query.email || "").toString().trim() : (req.body?.email || "").toString().trim();
-    if (!email) return res.status(400).send(`<div style="font-family:system-ui;padding:20px">
-      <h3>✅ BingoCardGen Email Test</h3>
-      <pre>GET  /api/test-email?email=you@bingocardgen.com</pre>
-      <pre>POST /api/test-email {"email":"you@bingocardgen.com"}</pre></div>`);
-    if (!RESEND_API_KEY) return res.status(500).send("Missing RESEND_API_KEY");
+    const email =
+      method === "GET"
+        ? (req.query.email || "").toString().trim()
+        : (req.body?.email || "").toString().trim();
 
-    const html = `<div style="font-family:system-ui,Arial,sans-serif;padding:20px;background:#0b1220;color:#eafaff;border-radius:10px">
-      <h2>👋 BingoCardGen Email Test</h2><p>Resend is working.</p><p>From ${SENDER_EMAIL}</p></div>`;
+    if (!email) {
+      return res.status(400).send(
+        `<div style="font-family:system-ui;padding:20px">
+          <h3>✅ BingoCardGen Email Test</h3>
+          <pre>GET  /api/test-email?email=you@bingocardgen.com</pre>
+          <pre>POST /api/test-email {"email":"you@bingocardgen.com"}</pre>
+        </div>`
+      );
+    }
+
+    if (!RESEND_API_KEY) {
+      return res.status(500).send("Missing RESEND_API_KEY");
+    }
+
+    const html = `
+      <div style="font-family:system-ui,Arial,sans-serif;padding:20px;background:#0b1220;color:#eafaff;border-radius:10px">
+        <h2>👋 BingoCardGen Email Test</h2>
+        <p>Resend is working.</p>
+        <p>From ${SENDER_EMAIL}</p>
+      </div>`.trim();
 
     const r = await fetch("https://api.resend.com/emails", {
       method: "POST",
-      headers: { Authorization: `Bearer ${RESEND_API_KEY}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ from: SENDER_EMAIL, to: [email], subject: "✅ BingoCardGen Resend Test", html }),
+      headers: {
+        Authorization: `Bearer ${RESEND_API_KEY}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        from: SENDER_EMAIL,
+        to: [email],
+        subject: "✅ BingoCardGen Resend Test",
+        html
+      })
     });
-    if (!r.ok) return res.status(500).send(`<b>Resend failed:</b><pre>${await r.text()}</pre>`);
-    res.send(`<div style="font-family:system-ui;padding:20px">Email sent to <b>${email}</b> ✅</div>`);
+
+    if (!r.ok) {
+      return res
+        .status(500)
+        .send(`<b>Resend failed:</b><pre>${await r.text()}</pre>`);
+    }
+
+    res.send(
+      `<div style="font-family:system-ui;padding:20px">
+         Email sent to <b>${email}</b> ✅
+       </div>`
+    );
   });
 } else {
-  app.all("/api/test-email", (_req, res) => res.status(404).send("Not found"));
+  app.all("/api/test-email", (_req, res) =>
+    res.status(404).send("Not found")
+  );
 }
 
 // --- Debug: verify Stripe connectivity (safe; returns only acct id) ---
 if (ENABLE_TEST_ROUTES) {
-  app.get('/api/debug/stripe', async (_req, res) => {
+  app.get("/api/debug/stripe", async (_req, res) => {
     try {
       const acct = await stripe.accounts.retrieve();
       res.json({ ok: true, account: acct.id });
     } catch (e) {
-      console.error('Stripe debug error:', e);
+      console.error("Stripe debug error:", e);
       res.status(500).json({ ok: false, error: e.message });
     }
   });
@@ -409,14 +445,21 @@ if (ENABLE_TEST_ROUTES) {
 // ---------- Stripe Checkout ----------
 app.post("/api/stripe/create-checkout", async (req, res) => {
   try {
-    const sid   = req.cookies?.sid;
-    const email = sid ? await DB.readSessionSid(sid)
-                      : (req.body?.email || "").trim().toLowerCase();
-    if (!email) return res.status(400).json({ ok:false, error:"unauthenticated" });
+    const sid = req.cookies?.sid;
+    const email = sid
+      ? await DB.readSessionSid(sid)
+      : (req.body?.email || "").trim().toLowerCase();
 
-    // make sure user exists (handy for mapping customer later)
-    const u = (await DB.getUser(email)) || { createdAt: Date.now(), pro: false };
-    await DB.setUser(email, u);
+    if (!email) {
+      return res.status(400).json({ ok: false, error: "unauthenticated" });
+    }
+
+    // Ensure user exists (helps later when mapping Stripe customer)
+    const existing = (await DB.getUser(email)) || {
+      createdAt: Date.now(),
+      pro: false
+    };
+    await DB.setUser(email, existing);
 
     const domain = "https://bingocardgen.com";
 
@@ -424,63 +467,63 @@ app.post("/api/stripe/create-checkout", async (req, res) => {
       mode: "subscription",
       payment_method_types: ["card"],
       customer_email: email,
-      allow_promotion_codes: true,        // enables coupon field
+      allow_promotion_codes: true, // enable coupon / promo code field
       line_items: [
         {
           price_data: {
             currency: "cad",
             product_data: {
               name: "BingoCardGen PRO",
-              description: "Unlimited themes, multipliers, ad-free printing, and batch tools. Billed monthly in Canadian dollars (CA$10.99).",
-              images: ["https://bingocardgen.com/assets/logo-mini.png"] // absolute https
+              description:
+                "Unlimited themes, multipliers, ad-free printing, and batch tools. Billed monthly in Canadian dollars (CA$10.99).",
+              images: ["https://bingocardgen.com/assets/logo-mini.png"]
             },
-            unit_amount: 1099,
+            unit_amount: 1099, // 10.99 CAD
             recurring: { interval: "month" }
           },
           quantity: 1
         }
       ],
-      // Stripe will inject the real session id
+      // Stripe injects the real Checkout Session ID here
       success_url: `${domain}/?pro=success&sid={CHECKOUT_SESSION_ID}`,
-      cancel_url:  `${domain}/?pro=cancel&sid={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${domain}/?pro=cancel&sid={CHECKOUT_SESSION_ID}`,
       metadata: { email }
     });
 
-    // Track pending so we can reconcile if webhook is slow
+    // Track pending checkout to reconcile if webhook is delayed
     await DB.setPending(session.id, email);
 
     console.log("✅ Stripe session created:", email, session.id);
-    return res.json({ ok:true, url: session.url });
+    return res.json({ ok: true, url: session.url });
   } catch (e) {
     console.error("❌ Stripe create-checkout error:", e);
-    return res.status(500).json({ ok:false, error:"server_error" });
+    return res.status(500).json({ ok: false, error: "server_error" });
   }
 });
-
-// 👇 Track the pending checkout so we can reconcile even if the webhook is delayed
-await DB.setPending(session.id, email);
-
-console.log("✅ Stripe session created:", email, session.id);
-return res.json({ ok: true, url: session.url });
 
 // Create a Stripe Billing Portal session
 app.post("/api/stripe/portal", async (req, res) => {
   try {
     const sid = req.cookies?.sid;
-    const email = sid && await DB.readSessionSid(sid);
-    if (!email) return res.status(401).json({ ok:false, error:"unauthenticated" });
+    const email = sid && (await DB.readSessionSid(sid));
+    if (!email) {
+      return res.status(401).json({ ok: false, error: "unauthenticated" });
+    }
 
     const u = await DB.getUser(email);
-    if (!u?.stripe_customer) return res.status(400).json({ ok:false, error:"no_customer" });
+    if (!u?.stripe_customer) {
+      return res.status(400).json({ ok: false, error: "no_customer" });
+    }
 
     const portal = await stripe.billingPortal.sessions.create({
       customer: u.stripe_customer,
       return_url: "https://bingocardgen.com"
     });
-    res.json({ ok:true, url: portal.url });
+
+    return res.json({ ok: true, url: portal.url });
   } catch (e) {
     console.error("portal error:", e);
-    res.status(500).json({ ok:false, error:"server_error" });
+    return res.status(500).json({ ok: false, error: "server_error" });
   }
 });
 
@@ -489,20 +532,42 @@ app.post("/api/stripe/refresh-pro", async (req, res) => {
   try {
     const { email } = req.body || {};
     const key = (email || "").toLowerCase();
-    if (!key) return res.status(400).json({ ok:false, error:"bad_email" });
+    if (!key) {
+      return res.status(400).json({ ok: false, error: "bad_email" });
+    }
 
     const u = await DB.getUser(key);
-    if (!u?.stripe_customer) return res.json({ ok:true, updated:false, pro: !!u?.pro });
+    if (!u?.stripe_customer) {
+      return res.json({
+        ok: true,
+        updated: false,
+        pro: !!u?.pro
+      });
+    }
 
-    const subs = await stripe.subscriptions.list({ customer: u.stripe_customer, status: "all", limit: 1 });
+    const subs = await stripe.subscriptions.list({
+      customer: u.stripe_customer,
+      status: "all",
+      limit: 1
+    });
+
     const sub = subs.data[0];
-    const active = !!sub && ["active","trialing","past_due"].includes(sub.status);
+    const active =
+      !!sub &&
+      ["active", "trialing", "past_due"].includes(sub.status);
+
     u.pro = active;
     await DB.setUser(key, u);
-    res.json({ ok:true, updated:true, pro: u.pro, status: sub?.status || "none" });
+
+    return res.json({
+      ok: true,
+      updated: true,
+      pro: u.pro,
+      status: sub?.status || "none"
+    });
   } catch (e) {
     console.error("refresh-pro error:", e);
-    res.status(500).json({ ok:false, error:"server_error" });
+    return res.status(500).json({ ok: false, error: "server_error" });
   }
 });
 
