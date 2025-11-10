@@ -20,6 +20,7 @@ const SESSION_SECRET = process.env.SESSION_SECRET || "dev-secret-change-me";
 const SENDER_EMAIL = process.env.SENDER_EMAIL || "BingoCardGen <no-reply@bingocardgen.com>";
 const RESEND_API_KEY = process.env.RESEND_API_KEY || "";
 const ENABLE_TEST_ROUTES = process.env.ENABLE_TEST_ROUTES === "1";
+const SUPPORT_TO = process.env.SUPPORT_TO || "you@yourdomain.com"; // 👈 add this
 
 // ---------- Redis (optional) ----------
 const url   = (process.env.UPSTASH_REDIS_REST_URL   || "").trim().replace(/\/+$/, "");
@@ -229,6 +230,61 @@ app.use(cookieParser(SESSION_SECRET));
 const randCode = () => String(Math.floor(100000 + Math.random() * 900000));
 
 // ---------- Routes ----------
+// Contact form: /api/contact
+app.post("/api/contact", async (req, res) => {
+  try {
+    const { email, subject, message } = req.body || {};
+
+    if (!message || typeof message !== "string" || !message.trim()) {
+      return res.status(400).json({ ok: false, error: "message_required" });
+    }
+
+    const fromEmail =
+      (email && String(email).trim()) || "no-email-provided@bingocardgen.com";
+    const safeSubject =
+      (subject && String(subject).trim()) || "BingoCardGen question or idea";
+
+    if (!RESEND_API_KEY) {
+      console.error("❌ /api/contact: Missing RESEND_API_KEY");
+      // Still say ok so users aren't punished if email not wired yet
+      return res.json({ ok: true, fallback: true });
+    }
+
+    const text =
+      `From: ${fromEmail}\n` +
+      `Subject: ${safeSubject}\n\n` +
+      `${message}`;
+
+    const payload = {
+      from: SENDER_EMAIL,
+      to: [SUPPORT_TO],
+      subject: `[BCG Contact] ${safeSubject}`,
+      text,
+    };
+
+    const r = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${RESEND_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    });
+
+    if (!r.ok) {
+      const body = await r.text();
+      console.error("❌ Resend contact send failed:", body);
+      return res
+        .status(502)
+        .json({ ok: false, error: "provider_error" });
+    }
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("❌ /api/contact error:", err);
+    return res.status(500).json({ ok: false, error: "server_error" });
+  }
+});
 app.get("/api/health", (_req, res) =>
   res.json({ ok: true, redis: !!redis, time: new Date().toISOString() })
 );
