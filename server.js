@@ -134,14 +134,24 @@ const DB = {
 async function getOrCreateUser(email) {
   const key = (email || "").toLowerCase();
   if (!key) return null;
+
   let u = await DB.getUser(key);
+
   if (!u) {
-    u = { createdAt: Date.now(), pro: false, tickets: 0 };
-    await DB.setUser(key, u);
-  } else if (typeof u.tickets !== "number") {
-    u.tickets = 0;
-    await DB.setUser(key, u);
+    u = {
+      createdAt: Date.now(),
+      pro: false,
+      tickets: 0,
+      lastDaily: null,
+      dailyStreak: 0
+    };
+  } else {
+    if (typeof u.tickets !== "number") u.tickets = 0;
+    if (typeof u.dailyStreak !== "number") u.dailyStreak = 0;
+    if (!("lastDaily" in u)) u.lastDaily = null;
   }
+
+  await DB.setUser(key, u);
   return u;
 }
 
@@ -159,9 +169,25 @@ async function creditTickets(email, amount) {
   return u.tickets;
 }
 
-// ---------- Daily Reward helpers ----------
+// ---------- Daily Reward helpers + streak ----------
 function todayKey() {
   return new Date().toISOString().slice(0, 10); // "YYYY-MM-DD"
+}
+
+function parseYmd(str) {
+  if (!str) return null;
+  const [y, m, d] = String(str).split("-").map((x) => parseInt(x, 10));
+  if (!y || !m || !d) return null;
+  return new Date(y, m - 1, d);
+}
+
+function daysBetween(a, b) {
+  const da = parseYmd(a);
+  const db = parseYmd(b);
+  if (!da || !db) return Infinity;
+  da.setHours(0, 0, 0, 0);
+  db.setHours(0, 0, 0, 0);
+  return Math.round((db - da) / 86400000);
 }
 
 async function hasClaimedDaily(email) {
@@ -650,16 +676,36 @@ app.get("/api/wallet", requireAuth, async (req, res) => {
 });
 
 // ---------- Daily Reward (GET status / POST claim) ----------
-const DAILY_REWARD_AMOUNT = 5; // tickets per day
+const DAILY_REWARD_AMOUNT = 15;  // base per day
+const DAILY_STREAK_TARGET = 7;   // bonus every 7th day
+const DAILY_STREAK_BONUS  = 50;  // bonus tickets on that day
 
-// Status
+// Status (for UI)
 app.get("/api/reward/daily", requireAuth, async (req, res) => {
   try {
     const claimed = await hasClaimedDaily(req.userEmail);
+    const u = await getOrCreateUser(req.userEmail);
+
+    const today = todayKey();
+    const last  = u.lastDaily || null;
+    const streak = Number(u.dailyStreak || 0);
+
+    const diff = last ? daysBetween(last, today) : Infinity;
+    let effectiveStreak = streak;
+
+    // if they've missed a day, streak would reset next claim
+    if (diff > 1) effectiveStreak = 0;
+
+    const nextStep = (DAILY_STREAK_TARGET - (effectiveStreak || 0));
+    const nextBonusIn = nextStep <= 0 ? DAILY_STREAK_TARGET : nextStep;
+
     res.json({
       ok: true,
       claimed,
-      amount: DAILY_REWARD_AMOUNT
+      amount: DAILY_REWARD_AMOUNT,
+      streak: effectiveStreak,
+      bonusTarget: DAILY_STREAK_TARGET,
+      nextBonusIn
     });
   } catch (e) {
     console.error("/api/reward/daily GET error:", e);
@@ -670,6 +716,7 @@ app.get("/api/reward/daily", requireAuth, async (req, res) => {
 // Claim
 app.post("/api/reward/daily", requireAuth, async (req, res) => {
   try {
+    // hard anti double-claim for the calendar day
     const already = await hasClaimedDaily(req.userEmail);
     if (already) {
       return res
@@ -677,16 +724,58 @@ app.post("/api/reward/daily", requireAuth, async (req, res) => {
         .json({ ok: false, error: "already_claimed" });
     }
 
-    // Credit tickets
-    const newBalance = await creditTickets(req.userEmail, DAILY_REWARD_AMOUNT);
+    const u = await getOrCreateUser(req.userEmail);
+    const today = todayKey();
+    const last  = u.lastDaily || null;
+    const prevStreak = Number(u.dailyStreak || 0);
 
-    // Mark as claimed for today
+    const diff = last ? daysBetween(last, today) : Infinity;
+
+    // streak maths:
+    //  - same day is blocked above by hasClaimedDaily
+    //  - diff == 1 -> consecutive day, streak+1
+    //  - otherwise -> new streak starting at 1
+    let newStreak;
+    if (!last || diff > 1) {
+      newStreak = 1;
+    } else if (diff === 1) {
+      newStreak = prevStreak + 1;
+    } else {
+      // diff == 0 is protected by already-claimed guard, but keep safe:
+      newStreak = prevStreak || 1;
+    }
+
+    // base reward
+    const base = DAILY_REWARD_AMOUNT;
+    let bonus = 0;
+
+    // if they *hit* the target today, pay bonus & reset streak to 0 so
+    // they can start a fresh 7-day run
+    if (newStreak >= DAILY_STREAK_TARGET) {
+      bonus = DAILY_STREAK_BONUS;
+      newStreak = 0;
+    }
+
+    const totalEarned = base + bonus;
+
+    // credit tickets
+    const newBalance = await creditTickets(req.userEmail, totalEarned);
+
+    // update user streak meta
+    u.lastDaily   = today;
+    u.dailyStreak = newStreak;
+    await DB.setUser(req.userEmail.toLowerCase(), u);
+
+    // mark as claimed for today
     await markClaimedDaily(req.userEmail);
 
     res.json({
       ok: true,
       claimed: true,
-      amount: DAILY_REWARD_AMOUNT,
+      amount: base,
+      bonus,
+      totalEarned,
+      streak: newStreak,
       tickets: newBalance
     });
   } catch (e) {
