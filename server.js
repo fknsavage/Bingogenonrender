@@ -203,6 +203,59 @@ const SUB_SKUS = {
 // ---------- App ----------
 const app = express();
 
+// ---- Simple News storage (Redis if available, else in-memory) ----
+const NEWS_REDIS_KEY = "BCG:NEWS_JSON";
+
+// Default fallback if nothing saved yet
+let NEWS_FALLBACK = [
+  {
+    date: "2025-11-10",
+    emoji: "🎄",
+    title: "Xmas pack in testing",
+    body: "Drunk Elves, Reindeer Bingo & Grinch Boards.",
+    tag: "themes"
+  },
+  {
+    date: "2025-11-11",
+    emoji: "💳",
+    title: "Billing & invoices",
+    body: "Pro billing + PDF invoice history syncing to one login.",
+    tag: "system"
+  },
+  {
+    date: "2025-11-12",
+    emoji: "🚀",
+    title: "Glass Gateway UI",
+    body: "Glass Gateway UI live in sandbox — Accounts moving to /account.",
+    tag: "devlog"
+  }
+];
+
+async function readNewsFeed() {
+  try {
+    if (redis) {
+      const stored = await redis.get(NEWS_REDIS_KEY);
+      if (stored && Array.isArray(stored)) {
+        return stored;
+      }
+    }
+  } catch (e) {
+    console.error("news read error:", e);
+  }
+  return NEWS_FALLBACK;
+}
+
+async function writeNewsFeed(items) {
+  // keep a local fallback as well
+  NEWS_FALLBACK = items;
+  if (!redis) return;
+  try {
+    await redis.set(NEWS_REDIS_KEY, items);
+  } catch (e) {
+    console.error("news write error:", e);
+  }
+}
+
 // ---- CORS (single, robust block) ----
 app.set("trust proxy", 1);
 
@@ -821,6 +874,48 @@ app.post("/api/stripe/refresh-pro", async (req, res) => {
     });
   } catch (e) {
     console.error("refresh-pro error:", e);
+    return res.status(500).json({ ok: false, error: "server_error" });
+  }
+});
+
+// ---------- Public News feed (front-end FEED URL) ----------
+app.get("/api/news", async (_req, res) => {
+  try {
+    const items = await readNewsFeed();
+    res.json(items);
+  } catch (e) {
+    console.error("/api/news error:", e);
+    res.status(500).json({ ok: false, error: "server_error" });
+  }
+});
+
+// ---------- Admin: publish News ----------
+app.post("/api/admin/news", async (req, res) => {
+  try {
+    const adminKeyEnv = process.env.NEWS_ADMIN_KEY || "bcg-goblin-2025";
+    const { key, items } = req.body || {};
+
+    if (!key || key !== adminKeyEnv) {
+      return res.status(403).json({ ok: false, error: "forbidden" });
+    }
+    if (!Array.isArray(items)) {
+      return res.status(400).json({ ok: false, error: "bad_payload" });
+    }
+
+    // Basic sanitizing and shape
+    const safe = items.map((i) => ({
+      date: String(i.date || "").slice(0, 10),
+      emoji: String(i.emoji || "📰").slice(0, 4),
+      title: String(i.title || "").slice(0, 140),
+      body: String(i.body || "").slice(0, 4000),
+      tag: String(i.tag || "general").slice(0, 32)
+    }));
+
+    await writeNewsFeed(safe);
+
+    return res.json({ ok: true, count: safe.length });
+  } catch (e) {
+    console.error("/api/admin/news error:", e);
     return res.status(500).json({ ok: false, error: "server_error" });
   }
 });
