@@ -32,7 +32,14 @@ const USE_REDIS = !!(url && token);
 const redis = USE_REDIS ? new Redis({ url, token }) : null; // ✅ single init
 
 // Simple DB adapter: Redis if configured, otherwise in-memory Maps
-const mem = { SESSIONS: new Map(), USERS: new Map(), C2E: new Map(), OTP: new Map(), PENDING: new Map() };
+const mem = {
+  SESSIONS: new Map(),
+  USERS:    new Map(),
+  C2E:      new Map(),
+  OTP:      new Map(),
+  PENDING:  new Map(),
+  DAILY:    new Map()   // 👈 daily reward claims when Redis is off
+};
 
 const DB = {
   // USERS
@@ -150,6 +157,35 @@ async function creditTickets(email, amount) {
   u.tickets = Number(u.tickets || 0) + amount;
   await DB.setUser(key, u);
   return u.tickets;
+}
+
+// ---------- Daily Reward helpers ----------
+function todayKey() {
+  return new Date().toISOString().slice(0, 10); // "YYYY-MM-DD"
+}
+
+async function hasClaimedDaily(email) {
+  const day = todayKey();
+  const key = `DAILY:${email}:${day}`;
+
+  if (redis) {
+    const v = await redis.get(key);
+    return !!v;
+  }
+
+  return mem.DAILY.has(key);
+}
+
+async function markClaimedDaily(email) {
+  const day = todayKey();
+  const key = `DAILY:${email}:${day}`;
+
+  if (redis) {
+    // 26h TTL just to be safe with timezones
+    await redis.set(key, "1", { ex: 26 * 3600 });
+  } else {
+    mem.DAILY.set(key, Date.now());
+  }
 }
 
 async function setPlan(email, plan) {
@@ -612,6 +648,53 @@ app.get("/api/wallet", requireAuth, async (req, res) => {
     res.status(500).json({ ok: false, error: "wallet_failed" });
   }
 });
+
+// ---------- Daily Reward (GET status / POST claim) ----------
+const DAILY_REWARD_AMOUNT = 5; // tickets per day
+
+// Status
+app.get("/api/reward/daily", requireAuth, async (req, res) => {
+  try {
+    const claimed = await hasClaimedDaily(req.userEmail);
+    res.json({
+      ok: true,
+      claimed,
+      amount: DAILY_REWARD_AMOUNT
+    });
+  } catch (e) {
+    console.error("/api/reward/daily GET error:", e);
+    res.status(500).json({ ok: false, error: "server_error" });
+  }
+});
+
+// Claim
+app.post("/api/reward/daily", requireAuth, async (req, res) => {
+  try {
+    const already = await hasClaimedDaily(req.userEmail);
+    if (already) {
+      return res
+        .status(409)
+        .json({ ok: false, error: "already_claimed" });
+    }
+
+    // Credit tickets
+    const newBalance = await creditTickets(req.userEmail, DAILY_REWARD_AMOUNT);
+
+    // Mark as claimed for today
+    await markClaimedDaily(req.userEmail);
+
+    res.json({
+      ok: true,
+      claimed: true,
+      amount: DAILY_REWARD_AMOUNT,
+      tickets: newBalance
+    });
+  } catch (e) {
+    console.error("/api/reward/daily POST error:", e);
+    res.status(500).json({ ok: false, error: "server_error" });
+  }
+});
+
 
 // ---------- Optional Test Email Route ----------
 if (ENABLE_TEST_ROUTES) {
