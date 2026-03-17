@@ -130,6 +130,49 @@ const DB = {
   }
 };
 
+const CARD_CATALOG = {
+  betty: { slug: "betty", name: "Betty Boop", priceCents: 0, priceDisplay: "Demo", free: true },
+  breakfast: { slug: "breakfast", name: "Breakfast Club", priceCents: 0, priceDisplay: "Demo", free: true },
+  puppy: { slug: "puppy", name: "Puppy Party", priceCents: 0, priceDisplay: "Demo", free: true },
+  ghostface: { slug: "ghostface", name: "Ghostface Bingo", priceCents: 499, priceDisplay: "$4.99", free: false },
+  annabelle: { slug: "annabelle", name: "Annabelle Bingo", priceCents: 499, priceDisplay: "$4.99", free: false },
+  chucky: { slug: "chucky", name: "Playtime Gone Wrong", priceCents: 499, priceDisplay: "$4.99", free: false },
+  freddyvsjason: { slug: "freddyvsjason", name: "Freddy Vs Jason", priceCents: 499, priceDisplay: "$4.99", free: false },
+  pennywise: { slug: "pennywise", name: "Pennywise Bingo", priceCents: 499, priceDisplay: "$4.99", free: false },
+  badsanta: { slug: "badsanta", name: "Bad Santa Bingo", priceCents: 399, priceDisplay: "$3.99", free: false },
+  drunkelfs: { slug: "drunkelfs", name: "Drunk Elfs Bingo", priceCents: 399, priceDisplay: "$3.99", free: false },
+  reindeers: { slug: "reindeers", name: "Gangster Reindeers Bingo", priceCents: 399, priceDisplay: "$3.99", free: false },
+  grinch: { slug: "grinch", name: "Grinch Bingo", priceCents: 399, priceDisplay: "$3.99", free: false },
+  louisvuitton: { slug: "louisvuitton", name: "Louis Vuitton", priceCents: 499, priceDisplay: "$4.99", free: false },
+  cheech: { slug: "cheech", name: "Cheech & Chong", priceCents: 499, priceDisplay: "$4.99", free: false }
+};
+
+function normalizeOwnedCards(input) {
+  const raw = Array.isArray(input) ? input : [];
+  const seen = new Set();
+  const out = [];
+  raw.forEach((slug) => {
+    const key = String(slug || "").trim().toLowerCase();
+    if (!CARD_CATALOG[key] || CARD_CATALOG[key].free || seen.has(key)) return;
+    seen.add(key);
+    out.push(key);
+  });
+  return out;
+}
+
+function normalizeCardSelection(input) {
+  const raw = Array.isArray(input) ? input : [];
+  const seen = new Set();
+  const out = [];
+  raw.forEach((slug) => {
+    const key = String(slug || "").trim().toLowerCase();
+    if (!CARD_CATALOG[key] || CARD_CATALOG[key].free || seen.has(key)) return;
+    seen.add(key);
+    out.push(key);
+  });
+  return out;
+}
+
 // ---------- High-level user helpers ----------
 async function getOrCreateUser(email) {
   const key = (email || "").toLowerCase();
@@ -143,12 +186,14 @@ async function getOrCreateUser(email) {
       pro: false,
       tickets: 0,
       lastDaily: null,
-      dailyStreak: 0
+      dailyStreak: 0,
+      owned_cards: []
     };
   } else {
     if (typeof u.tickets !== "number") u.tickets = 0;
     if (typeof u.dailyStreak !== "number") u.dailyStreak = 0;
     if (!("lastDaily" in u)) u.lastDaily = null;
+    u.owned_cards = normalizeOwnedCards(u.owned_cards);
   }
 
   await DB.setUser(key, u);
@@ -221,6 +266,23 @@ async function setPlan(email, plan) {
   if (plan) u.pro = true;
   await DB.setUser(key, u);
   return u;
+}
+
+async function addOwnedCards(email, cards) {
+  const key = (email || "").toLowerCase();
+  const selection = normalizeCardSelection(cards);
+  if (!key || !selection.length) return [];
+  const u = await getOrCreateUser(key);
+  const owned = new Set(normalizeOwnedCards(u.owned_cards));
+  selection.forEach((slug) => owned.add(slug));
+  u.owned_cards = Array.from(owned);
+  await DB.setUser(key, u);
+  return u.owned_cards;
+}
+
+async function getOwnedCards(email) {
+  const u = await getOrCreateUser(email);
+  return normalizeOwnedCards(u?.owned_cards);
 }
 
 // ---------- SKU maps for Store + Subs ----------
@@ -370,6 +432,8 @@ app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async
         const s = event.data.object;
         const metadata = s.metadata || {};
         const sku = metadata.sku || null;
+        const checkoutKind = metadata.kind || "legacy";
+        const cardSlugs = normalizeCardSelection(String(metadata.cards || "").split(","));
 
         let email =
           (s.customer_details && s.customer_details.email) ||
@@ -394,7 +458,11 @@ app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async
         }
 
         // 1) Ticket packs (STORE SKUs)
-        if (sku && STORE_SKUS[sku]) {
+        if (checkoutKind === "cards" && cardSlugs.length) {
+          const ownedCards = await addOwnedCards(key, cardSlugs);
+          console.log(`🃏 Card checkout completed for ${key}:`, ownedCards.join(", "));
+        }
+        else if (sku && STORE_SKUS[sku]) {
           const pack = STORE_SKUS[sku];
           const added = Number(pack.tickets || 0);
           if (added > 0) {
@@ -552,11 +620,11 @@ app.post("/api/auth/otp/start", async (req, res) => {
     // 1. Reuse existing valid OTP if present
     let code = await DB.getOTP(email);
     if (code) {
-      console.log(`⏱️ Reusing existing valid OTP for ${email}: ${code}`);
+      console.log(`⏱️ Reusing existing valid OTP for ${email}`);
     } else {
       code = randCode();
       await DB.setOTP(email, code, 300); // 5 min
-      console.log(`✅ Generated new OTP for ${email}: ${code}`);
+      console.log(`✅ Generated new OTP for ${email}`);
     }
 
     // ensure user record exists
@@ -575,7 +643,7 @@ app.post("/api/auth/otp/start", async (req, res) => {
     else mem.OTP.set(throttleKey, { code: 1, exp: Date.now() + 20000 });
 
     if (!RESEND_API_KEY) {
-      console.log("🔐 OTP for", email, "=>", code);
+      console.log("🔐 OTP generated for", email);
       return res.json({ ok: true, sent: "log" });
     }
 
@@ -616,15 +684,13 @@ app.post("/api/auth/otp/verify", async (req, res) => {
     }
 
     const stored = await DB.getOTP(email);
-    console.log("VERIFY attempt", { email, code, stored });
-
     if (!stored) {
       console.warn("VERIFY expired_or_missing", { email });
       return res.status(400).json({ ok: false, error: "expired_or_missing" });
     }
 
     if (String(stored).trim() !== code) {
-      console.warn("VERIFY invalid_code", { email, code, stored: String(stored).trim() });
+      console.warn("VERIFY invalid_code", { email });
       return res.status(400).json({ ok: false, error: "invalid_code" });
     }
 
@@ -654,7 +720,14 @@ app.get("/api/me", async (req, res) => {
   const email = await DB.readSessionSid(sid);
   if (!email) return res.json({ authed: false });
   const u = await getOrCreateUser(email);
-  res.json({ authed: true, email, pro: !!u.pro, plan: u.plan || null, tickets: Number(u.tickets || 0) });
+  res.json({
+    authed: true,
+    email,
+    pro: !!u.pro,
+    plan: u.plan || null,
+    tickets: Number(u.tickets || 0),
+    owned_cards: normalizeOwnedCards(u.owned_cards)
+  });
 });
 
 // logout
@@ -672,6 +745,21 @@ app.get("/api/wallet", requireAuth, async (req, res) => {
   } catch (e) {
     console.error("wallet get error", e);
     res.status(500).json({ ok: false, error: "wallet_failed" });
+  }
+});
+
+app.get("/api/me/library", requireAuth, async (req, res) => {
+  try {
+    const owned = await getOwnedCards(req.userEmail);
+    res.json({
+      ok: true,
+      email: req.userEmail,
+      owned_cards: owned,
+      demo_cards: Object.values(CARD_CATALOG).filter((card) => card.free).map((card) => card.slug)
+    });
+  } catch (e) {
+    console.error("library get error", e);
+    res.status(500).json({ ok: false, error: "library_failed" });
   }
 });
 
@@ -894,6 +982,57 @@ app.post("/api/stripe/store-checkout", requireAuth, async (req, res) => {
   }
 });
 
+app.post("/api/stripe/cards-checkout", requireAuth, async (req, res) => {
+  try {
+    const requested = normalizeCardSelection(req.body?.cards);
+    if (!requested.length) {
+      return res.status(400).json({ ok: false, error: "no_cards" });
+    }
+
+    const alreadyOwned = new Set(await getOwnedCards(req.userEmail));
+    const checkoutCards = requested.filter((slug) => !alreadyOwned.has(slug));
+    if (!checkoutCards.length) {
+      return res.status(400).json({ ok: false, error: "already_owned" });
+    }
+
+    const line_items = checkoutCards.map((slug) => {
+      const card = CARD_CATALOG[slug];
+      return {
+        price_data: {
+          currency: "usd",
+          product_data: {
+            name: `${card.name} Digital Bingo Card`,
+            description: "Tablet-first Caller 15x5 digital bingo card.",
+            images: [`${FRONTEND_BASE_URL}/assets/themes/${slug}.png`]
+          },
+          unit_amount: card.priceCents
+        },
+        quantity: 1
+      };
+    });
+
+    const session = await stripe.checkout.sessions.create({
+      mode: "payment",
+      customer_email: req.userEmail,
+      allow_promotion_codes: true,
+      line_items,
+      metadata: {
+        email: req.userEmail,
+        kind: "cards",
+        cards: checkoutCards.join(",")
+      },
+      success_url: `${FRONTEND_BASE_URL}/beta.html?checkout=success`,
+      cancel_url: `${FRONTEND_BASE_URL}/beta.html?checkout=cancel`
+    });
+
+    await DB.setPending(session.id, req.userEmail);
+    res.json({ ok: true, url: session.url, cards: checkoutCards });
+  } catch (e) {
+    console.error("cards checkout error", e);
+    res.status(500).json({ ok: false, error: "checkout_failed" });
+  }
+});
+
 // ---------- Stripe: Subscriptions (Creator / Pro Host / Lifetime) ----------
 app.post("/api/stripe/subscribe", requireAuth, async (req, res) => {
   try {
@@ -1007,13 +1146,9 @@ app.post("/api/stripe/portal", async (req, res) => {
 });
 
 // Force-check subscription state from Stripe (support tool)
-app.post("/api/stripe/refresh-pro", async (req, res) => {
+app.post("/api/stripe/refresh-pro", requireAuth, async (req, res) => {
   try {
-    const { email } = req.body || {};
-    const key = (email || "").toLowerCase();
-    if (!key) {
-      return res.status(400).json({ ok: false, error: "bad_email" });
-    }
+    const key = (req.userEmail || "").toLowerCase();
 
     const u = await getOrCreateUser(key);
     if (!u?.stripe_customer) {
@@ -1049,6 +1184,22 @@ app.post("/api/stripe/refresh-pro", async (req, res) => {
     return res.status(500).json({ ok: false, error: "server_error" });
   }
 });
+
+if (ENABLE_TEST_ROUTES) {
+  app.post("/api/dev/grant-card", requireAuth, async (req, res) => {
+    try {
+      const cards = normalizeCardSelection(req.body?.cards || [req.body?.card]);
+      if (!cards.length) {
+        return res.status(400).json({ ok: false, error: "no_cards" });
+      }
+      const owned = await addOwnedCards(req.userEmail, cards);
+      return res.json({ ok: true, owned_cards: owned });
+    } catch (e) {
+      console.error("grant-card error:", e);
+      return res.status(500).json({ ok: false, error: "server_error" });
+    }
+  });
+}
 
 // ---------- Public News feed (front-end FEED URL) ----------
 app.get("/api/news", async (_req, res) => {
