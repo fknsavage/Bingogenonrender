@@ -30,6 +30,42 @@ const url   = (process.env.UPSTASH_REDIS_REST_URL   || "").trim().replace(/\/+$/
 const token = (process.env.UPSTASH_REDIS_REST_TOKEN || "").trim();
 const USE_REDIS = !!(url && token);
 const redis = USE_REDIS ? new Redis({ url, token }) : null; // ✅ single init
+let redisHealthy = USE_REDIS;
+
+async function redisGetSafe(key) {
+  if (!redis || !redisHealthy) return null;
+  try {
+    return await redis.get(key);
+  } catch (err) {
+    redisHealthy = false;
+    console.error("Redis get failed, falling back to memory:", err?.message || err);
+    return null;
+  }
+}
+
+async function redisSetSafe(key, value, options) {
+  if (!redis || !redisHealthy) return false;
+  try {
+    await redis.set(key, value, options);
+    return true;
+  } catch (err) {
+    redisHealthy = false;
+    console.error("Redis set failed, falling back to memory:", err?.message || err);
+    return false;
+  }
+}
+
+async function redisDelSafe(key) {
+  if (!redis || !redisHealthy) return false;
+  try {
+    await redis.del(key);
+    return true;
+  } catch (err) {
+    redisHealthy = false;
+    console.error("Redis del failed, falling back to memory:", err?.message || err);
+    return false;
+  }
+}
 
 // Simple DB adapter: Redis if configured, otherwise in-memory Maps
 const mem = {
@@ -45,40 +81,44 @@ const DB = {
   // USERS
   async getUser(email) {
     if (!email) return null;
-    if (redis) return await redis.get(`USER:${email}`);
+    const fromRedis = await redisGetSafe(`USER:${email}`);
+    if (fromRedis) return fromRedis;
     return mem.USERS.get(email) || null;
   },
   async setUser(email, obj) {
     if (!email) return;
-    if (redis) await redis.set(`USER:${email}`, obj);
-    else mem.USERS.set(email, obj);
+    const saved = await redisSetSafe(`USER:${email}`, obj);
+    if (!saved) mem.USERS.set(email, obj);
   },
 
   // CustomerId <-> Email
   async mapCustomer(cusId, email) {
     if (!cusId || !email) return;
-    if (redis) await redis.set(`C2E:${cusId}`, email);
-    else mem.C2E.set(cusId, email);
+    const saved = await redisSetSafe(`C2E:${cusId}`, email);
+    if (!saved) mem.C2E.set(cusId, email);
   },
   async emailByCustomer(cusId) {
-    if (redis) return await redis.get(`C2E:${cusId}`);
+    const fromRedis = await redisGetSafe(`C2E:${cusId}`);
+    if (fromRedis) return fromRedis;
     return mem.C2E.get(cusId) || null;
   },
 
   // OTP (5 min TTL)
   async setOTP(email, code, ttlSec = 300) {
-    if (redis) await redis.set(`OTP:${email}`, code, { ex: ttlSec });
-    else mem.OTP.set(email, { code, exp: Date.now() + ttlSec * 1000 });
+    const saved = await redisSetSafe(`OTP:${email}`, code, { ex: ttlSec });
+    if (!saved) mem.OTP.set(email, { code, exp: Date.now() + ttlSec * 1000 });
   },
   async getOTP(email) {
-    if (redis) return await redis.get(`OTP:${email}`);
+    const fromRedis = await redisGetSafe(`OTP:${email}`);
+    if (fromRedis) return fromRedis;
     const rec = mem.OTP.get(email);
     if (!rec) return null;
     if (rec.exp < Date.now()) { mem.OTP.delete(email); return null; }
     return rec.code;
   },
   async delOTP(email) {
-    if (redis) await redis.del(`OTP:${email}`); else mem.OTP.delete(email);
+    const deleted = await redisDelSafe(`OTP:${email}`);
+    if (!deleted) mem.OTP.delete(email);
   },
 
   // Sessions (14d TTL)
@@ -87,37 +127,41 @@ const DB = {
     const sig = crypto.createHmac("sha256", SESSION_SECRET).update(sidRaw).digest("hex");
     const sid = `${sidRaw}.${sig}`;
     const ttlSec = 14 * 24 * 3600;
-    if (redis) await redis.set(`SID:${sid}`, email, { ex: ttlSec });
-    else mem.SESSIONS.set(sid, { email, exp: Date.now() + ttlSec * 1000 });
+    const saved = await redisSetSafe(`SID:${sid}`, email, { ex: ttlSec });
+    if (!saved) mem.SESSIONS.set(sid, { email, exp: Date.now() + ttlSec * 1000 });
     return sid;
   },
   async readSessionSid(sid) {
     if (!sid) return null;
-    if (redis) return await redis.get(`SID:${sid}`);
+    const fromRedis = await redisGetSafe(`SID:${sid}`);
+    if (fromRedis) return fromRedis;
     const rec = mem.SESSIONS.get(sid);
     if (!rec) return null;
     if (rec.exp < Date.now()) { mem.SESSIONS.delete(sid); return null; }
     return rec.email;
   },
   async delSession(sid) {
-    if (redis) await redis.del(`SID:${sid}`); else mem.SESSIONS.delete(sid);
+    const deleted = await redisDelSafe(`SID:${sid}`);
+    if (!deleted) mem.SESSIONS.delete(sid);
   },
 
   // --- Pending Stripe checkout session <-> email (24h TTL) ---
   async setPending(sessionId, email) {
     if (!sessionId || !email) return;
-    if (redis) await redis.set(`PENDING:${sessionId}`, email, { ex: 24 * 3600 });
-    else mem.PENDING.set(sessionId, { email, exp: Date.now() + 24 * 3600 * 1000 });
+    const saved = await redisSetSafe(`PENDING:${sessionId}`, email, { ex: 24 * 3600 });
+    if (!saved) mem.PENDING.set(sessionId, { email, exp: Date.now() + 24 * 3600 * 1000 });
   },
   async getPending(sessionId) {
-    if (redis) return await redis.get(`PENDING:${sessionId}`);
+    const fromRedis = await redisGetSafe(`PENDING:${sessionId}`);
+    if (fromRedis) return fromRedis;
     const rec = mem.PENDING.get(sessionId);
     if (!rec) return null;
     if (rec.exp < Date.now()) { mem.PENDING.delete(sessionId); return null; }
     return rec.email;
   },
   async delPending(sessionId) {
-    if (redis) await redis.del(`PENDING:${sessionId}`); else mem.PENDING.delete(sessionId);
+    const deleted = await redisDelSafe(`PENDING:${sessionId}`);
+    if (!deleted) mem.PENDING.delete(sessionId);
   },
 
   // Safe PRO toggle helper (legacy)
@@ -187,13 +231,15 @@ async function getOrCreateUser(email) {
       tickets: 0,
       lastDaily: null,
       dailyStreak: 0,
-      owned_cards: []
+      owned_cards: [],
+      current_sid: null
     };
   } else {
     if (typeof u.tickets !== "number") u.tickets = 0;
     if (typeof u.dailyStreak !== "number") u.dailyStreak = 0;
     if (!("lastDaily" in u)) u.lastDaily = null;
     u.owned_cards = normalizeOwnedCards(u.owned_cards);
+    if (!("current_sid" in u)) u.current_sid = null;
   }
 
   await DB.setUser(key, u);
@@ -239,8 +285,8 @@ async function hasClaimedDaily(email) {
   const day = todayKey();
   const key = `DAILY:${email}:${day}`;
 
-  if (redis) {
-    const v = await redis.get(key);
+  if (redisHealthy) {
+    const v = await redisGetSafe(key);
     return !!v;
   }
 
@@ -251,12 +297,12 @@ async function markClaimedDaily(email) {
   const day = todayKey();
   const key = `DAILY:${email}:${day}`;
 
-  if (redis) {
+  if (redisHealthy) {
     // 26h TTL just to be safe with timezones
-    await redis.set(key, "1", { ex: 26 * 3600 });
-  } else {
-    mem.DAILY.set(key, Date.now());
+    const saved = await redisSetSafe(key, "1", { ex: 26 * 3600 });
+    if (saved) return;
   }
+  mem.DAILY.set(key, Date.now());
 }
 
 async function setPlan(email, plan) {
@@ -283,6 +329,19 @@ async function addOwnedCards(email, cards) {
 async function getOwnedCards(email) {
   const u = await getOrCreateUser(email);
   return normalizeOwnedCards(u?.owned_cards);
+}
+
+async function rotateSingleSession(email) {
+  const key = (email || "").toLowerCase();
+  const u = await getOrCreateUser(key);
+  const priorSid = u.current_sid || "";
+  if (priorSid) {
+    await DB.delSession(priorSid);
+  }
+  const sid = await DB.newSession(key);
+  u.current_sid = sid;
+  await DB.setUser(key, u);
+  return { sid, user: u };
 }
 
 // ---------- SKU maps for Store + Subs ----------
@@ -357,8 +416,8 @@ let NEWS_FALLBACK = [
 
 async function readNewsFeed() {
   try {
-    if (redis) {
-      const stored = await redis.get(NEWS_REDIS_KEY);
+    if (redisHealthy) {
+      const stored = await redisGetSafe(NEWS_REDIS_KEY);
       if (stored && Array.isArray(stored)) {
         return stored;
       }
@@ -372,9 +431,9 @@ async function readNewsFeed() {
 async function writeNewsFeed(items) {
   // keep a local fallback as well
   NEWS_FALLBACK = items;
-  if (!redis) return;
+  if (!redisHealthy) return;
   try {
-    await redis.set(NEWS_REDIS_KEY, items);
+    await redisSetSafe(NEWS_REDIS_KEY, items);
   } catch (e) {
     console.error("news write error:", e);
   }
@@ -542,6 +601,10 @@ async function requireAuth(req, res, next) {
       return res.status(401).json({ ok: false, error: "unauthenticated" });
     }
     const u = await getOrCreateUser(email);
+    if (!u.current_sid || u.current_sid !== sid) {
+      if (sid) await DB.delSession(sid);
+      return res.status(401).json({ ok: false, error: "session_replaced" });
+    }
     req.userEmail = email;
     req.user = u;
     next();
@@ -632,15 +695,19 @@ app.post("/api/auth/otp/start", async (req, res) => {
 
     // 2. Throttle email sends
     const throttleKey = `OTP:SENT:${email}`;
-    const recent = redis ? await redis.get(throttleKey) : mem.OTP.get(throttleKey);
+    const recent = redisHealthy ? await redisGetSafe(throttleKey) : mem.OTP.get(throttleKey);
 
     if (recent && RESEND_API_KEY) {
       console.log(`⏱️ Email send throttled for ${email}`);
       return res.json({ ok: true, sent: "throttled" });
     }
 
-    if (redis) await redis.set(throttleKey, "1", { ex: 20 });
-    else mem.OTP.set(throttleKey, { code: 1, exp: Date.now() + 20000 });
+    if (redisHealthy) {
+      const saved = await redisSetSafe(throttleKey, "1", { ex: 20 });
+      if (!saved) mem.OTP.set(throttleKey, { code: 1, exp: Date.now() + 20000 });
+    } else {
+      mem.OTP.set(throttleKey, { code: 1, exp: Date.now() + 20000 });
+    }
 
     if (!RESEND_API_KEY) {
       console.log("🔐 OTP generated for", email);
@@ -696,7 +763,7 @@ app.post("/api/auth/otp/verify", async (req, res) => {
 
     await DB.delOTP(email);
 
-    const sid = await DB.newSession(email);
+    const { sid, user } = await rotateSingleSession(email);
     res.cookie("sid", sid, {
       httpOnly: true,
       sameSite: "lax",
@@ -704,10 +771,8 @@ app.post("/api/auth/otp/verify", async (req, res) => {
       maxAge: 14 * 24 * 3600 * 1000
     });
 
-    const u = await getOrCreateUser(email);
-
-    console.log("VERIFY success", { email, pro: !!u.pro });
-    return res.json({ ok: true, user: { email, pro: !!u.pro } });
+    console.log("VERIFY success", { email, pro: !!user.pro });
+    return res.json({ ok: true, user: { email, pro: !!user.pro } });
   } catch (e) {
     console.error("❌ OTP verify error:", e);
     return res.status(500).json({ ok: false, error: "server_error" });
@@ -720,6 +785,10 @@ app.get("/api/me", async (req, res) => {
   const email = await DB.readSessionSid(sid);
   if (!email) return res.json({ authed: false });
   const u = await getOrCreateUser(email);
+  if (!u.current_sid || u.current_sid !== sid) {
+    if (sid) await DB.delSession(sid);
+    return res.json({ authed: false });
+  }
   res.json({
     authed: true,
     email,
@@ -732,7 +801,18 @@ app.get("/api/me", async (req, res) => {
 
 // logout
 app.post("/api/logout", async (req, res) => {
-  const sid = req.cookies?.sid; if (sid) await DB.delSession(sid);
+  const sid = req.cookies?.sid;
+  if (sid) {
+    const email = await DB.readSessionSid(sid);
+    if (email) {
+      const u = await getOrCreateUser(email);
+      if (u.current_sid === sid) {
+        u.current_sid = null;
+        await DB.setUser(email, u);
+      }
+    }
+    await DB.delSession(sid);
+  }
   res.clearCookie("sid", { httpOnly: true, sameSite: "lax", secure: true });
   res.json({ ok: true });
 });
