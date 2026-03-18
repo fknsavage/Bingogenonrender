@@ -24,6 +24,9 @@ const RESEND_API_KEY = process.env.RESEND_API_KEY || "";
 const ENABLE_TEST_ROUTES = process.env.ENABLE_TEST_ROUTES === "1";
 const SUPPORT_TO = process.env.SUPPORT_TO || "you@yourdomain.com";
 const FRONTEND_BASE_URL = process.env.FRONTEND_BASE_URL || "https://bingocardgen.com";
+const ADMIN_SUBSCRIBER_WHITELIST = [
+  "fgrant042@gmail.com"
+].map((email) => String(email || "").trim().toLowerCase());
 
 // ---------- Redis (optional) ----------
 const url   = (process.env.UPSTASH_REDIS_REST_URL   || "").trim().replace(/\/+$/, "");
@@ -67,6 +70,19 @@ async function redisDelSafe(key) {
   }
 }
 
+function isWhitelistedSubscriber(email) {
+  const key = String(email || "").trim().toLowerCase();
+  return !!key && ADMIN_SUBSCRIBER_WHITELIST.includes(key);
+}
+
+function applyWhitelistedSubscriberOverride(email, user) {
+  if (!user || !isWhitelistedSubscriber(email)) return user;
+  user.pro = true;
+  user.subscription_status = "active";
+  user.renews_at = null;
+  return user;
+}
+
 // Simple DB adapter: Redis if configured, otherwise in-memory Maps
 const mem = {
   SESSIONS: new Map(),
@@ -87,6 +103,7 @@ const DB = {
   },
   async setUser(email, obj) {
     if (!email) return;
+    obj = applyWhitelistedSubscriberOverride(email, obj);
     const saved = await redisSetSafe(`USER:${email}`, obj);
     if (!saved) mem.USERS.set(email, obj);
   },
@@ -170,6 +187,7 @@ const DB = {
     const u = (await DB.getUser(key)) || { createdAt: Date.now(), pro: false, tickets: 0 };
     u.pro = !!on;
     if (customerId) u.stripe_customer = customerId;
+    applyWhitelistedSubscriberOverride(key, u);
     await DB.setUser(key, u);
   }
 };
@@ -267,6 +285,7 @@ async function getOrCreateUser(email) {
     if (!("current_sid" in u)) u.current_sid = null;
   }
 
+  applyWhitelistedSubscriberOverride(key, u);
   await DB.setUser(key, u);
   return u;
 }
@@ -335,6 +354,7 @@ async function setPlan(email, plan) {
   const u = await getOrCreateUser(key);
   u.plan = plan;
   if (plan) u.pro = true;
+  applyWhitelistedSubscriberOverride(key, u);
   await DB.setUser(key, u);
   return u;
 }
