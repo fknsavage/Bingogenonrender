@@ -182,7 +182,6 @@ const CARD_CATALOG = {
   casinofortune: { slug: "casinofortune", name: "Casino Fortune", priceCents: 499, priceDisplay: "$4.99", free: false },
   annabelle: { slug: "annabelle", name: "Annabelle Bingo", priceCents: 499, priceDisplay: "$4.99", free: false },
   chucky: { slug: "chucky", name: "Playtime Gone Wrong", priceCents: 499, priceDisplay: "$4.99", free: false },
-  cheechnchong: { slug: "cheechnchong", name: "Cheech & Chong", priceCents: 499, priceDisplay: "$4.99", free: false },
   freddyvsjason: { slug: "freddyvsjason", name: "Freddy Vs Jason", priceCents: 499, priceDisplay: "$4.99", free: false },
   crimescene: { slug: "crimescene", name: "Crime Scene", priceCents: 499, priceDisplay: "$4.99", free: false },
   pennywise: { slug: "pennywise", name: "Pennywise Bingo", priceCents: 499, priceDisplay: "$4.99", free: false },
@@ -195,7 +194,7 @@ const CARD_CATALOG = {
   luxuriousfashion: { slug: "luxuriousfashion", name: "Luxurious Fashion", priceCents: 499, priceDisplay: "$4.99", free: false },
   louisvuitton: { slug: "louisvuitton", name: "Louis Vuitton", priceCents: 499, priceDisplay: "$4.99", free: false },
   cheech: { slug: "cheech", name: "Cheech & Chong", priceCents: 499, priceDisplay: "$4.99", free: false },
-  tittanic: { slug: "tittanic", name: "Tittanic", priceCents: 499, priceDisplay: "$4.99", free: false }
+  titanic: { slug: "titanic", name: "Titanic", priceCents: 499, priceDisplay: "$4.99", free: false }
 };
 
 function normalizeOwnedCards(input) {
