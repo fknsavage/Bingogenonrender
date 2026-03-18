@@ -25,7 +25,9 @@ const ENABLE_TEST_ROUTES = process.env.ENABLE_TEST_ROUTES === "1";
 const SUPPORT_TO = process.env.SUPPORT_TO || "you@yourdomain.com";
 const FRONTEND_BASE_URL = process.env.FRONTEND_BASE_URL || "https://bingocardgen.com";
 const ADMIN_SUBSCRIBER_WHITELIST = [
-  "fgrant042@gmail.com"
+  "fgrant042@gmail.com",
+  "lynnbrandi1@icloud.com",
+  "angie-angie2025@hotmail.com"
 ].map((email) => String(email || "").trim().toLowerCase());
 
 // ---------- Redis (optional) ----------
