@@ -179,16 +179,23 @@ const CARD_CATALOG = {
   breakfast: { slug: "breakfast", name: "Breakfast Club", priceCents: 0, priceDisplay: "Demo", free: true },
   puppy: { slug: "puppy", name: "Puppy Party", priceCents: 0, priceDisplay: "Demo", free: true },
   ghostface: { slug: "ghostface", name: "Ghostface Bingo", priceCents: 499, priceDisplay: "$4.99", free: false },
+  casinofortune: { slug: "casinofortune", name: "Casino Fortune", priceCents: 499, priceDisplay: "$4.99", free: false },
   annabelle: { slug: "annabelle", name: "Annabelle Bingo", priceCents: 499, priceDisplay: "$4.99", free: false },
   chucky: { slug: "chucky", name: "Playtime Gone Wrong", priceCents: 499, priceDisplay: "$4.99", free: false },
+  cheechnchong: { slug: "cheechnchong", name: "Cheech & Chong", priceCents: 499, priceDisplay: "$4.99", free: false },
   freddyvsjason: { slug: "freddyvsjason", name: "Freddy Vs Jason", priceCents: 499, priceDisplay: "$4.99", free: false },
+  crimescene: { slug: "crimescene", name: "Crime Scene", priceCents: 499, priceDisplay: "$4.99", free: false },
   pennywise: { slug: "pennywise", name: "Pennywise Bingo", priceCents: 499, priceDisplay: "$4.99", free: false },
   badsanta: { slug: "badsanta", name: "Bad Santa Bingo", priceCents: 399, priceDisplay: "$3.99", free: false },
   drunkelfs: { slug: "drunkelfs", name: "Drunk Elfs Bingo", priceCents: 399, priceDisplay: "$3.99", free: false },
+  elegantwineandcheesenight: { slug: "elegantwineandcheesenight", name: "Elegant Wine & Cheese Night", priceCents: 499, priceDisplay: "$4.99", free: false },
+  glamorouspinkluxury: { slug: "glamorouspinkluxury", name: "Glamorous Pink Luxury", priceCents: 499, priceDisplay: "$4.99", free: false },
   reindeers: { slug: "reindeers", name: "Gangster Reindeers Bingo", priceCents: 399, priceDisplay: "$3.99", free: false },
   grinch: { slug: "grinch", name: "Grinch Bingo", priceCents: 399, priceDisplay: "$3.99", free: false },
+  luxuriousfashion: { slug: "luxuriousfashion", name: "Luxurious Fashion", priceCents: 499, priceDisplay: "$4.99", free: false },
   louisvuitton: { slug: "louisvuitton", name: "Louis Vuitton", priceCents: 499, priceDisplay: "$4.99", free: false },
-  cheech: { slug: "cheech", name: "Cheech & Chong", priceCents: 499, priceDisplay: "$4.99", free: false }
+  cheech: { slug: "cheech", name: "Cheech & Chong", priceCents: 499, priceDisplay: "$4.99", free: false },
+  tittanic: { slug: "tittanic", name: "Tittanic", priceCents: 499, priceDisplay: "$4.99", free: false }
 };
 
 function normalizeOwnedCards(input) {
@@ -217,6 +224,19 @@ function normalizeCardSelection(input) {
   return out;
 }
 
+function normalizeFavoriteCards(input) {
+  const raw = Array.isArray(input) ? input : [];
+  const seen = new Set();
+  const out = [];
+  raw.forEach((slug) => {
+    const key = String(slug || "").trim().toLowerCase();
+    if (!CARD_CATALOG[key] || seen.has(key)) return;
+    seen.add(key);
+    out.push(key);
+  });
+  return out;
+}
+
 // ---------- High-level user helpers ----------
 async function getOrCreateUser(email) {
   const key = (email || "").toLowerCase();
@@ -232,6 +252,9 @@ async function getOrCreateUser(email) {
       lastDaily: null,
       dailyStreak: 0,
       owned_cards: [],
+      favorite_cards: [],
+      subscription_status: "none",
+      renews_at: null,
       current_sid: null
     };
   } else {
@@ -239,6 +262,9 @@ async function getOrCreateUser(email) {
     if (typeof u.dailyStreak !== "number") u.dailyStreak = 0;
     if (!("lastDaily" in u)) u.lastDaily = null;
     u.owned_cards = normalizeOwnedCards(u.owned_cards);
+    u.favorite_cards = normalizeFavoriteCards(u.favorite_cards);
+    if (!("subscription_status" in u)) u.subscription_status = u.pro ? "active" : "none";
+    if (!("renews_at" in u)) u.renews_at = null;
     if (!("current_sid" in u)) u.current_sid = null;
   }
 
@@ -329,6 +355,33 @@ async function addOwnedCards(email, cards) {
 async function getOwnedCards(email) {
   const u = await getOrCreateUser(email);
   return normalizeOwnedCards(u?.owned_cards);
+}
+
+async function addFavoriteCard(email, slug) {
+  const key = (email || "").toLowerCase();
+  const theme = normalizeFavoriteCards([slug]);
+  if (!key || !theme.length) return [];
+  const u = await getOrCreateUser(key);
+  const saved = new Set(normalizeFavoriteCards(u.favorite_cards));
+  saved.add(theme[0]);
+  u.favorite_cards = Array.from(saved);
+  await DB.setUser(key, u);
+  return u.favorite_cards;
+}
+
+async function removeFavoriteCard(email, slug) {
+  const key = (email || "").toLowerCase();
+  const u = await getOrCreateUser(key);
+  const saved = new Set(normalizeFavoriteCards(u.favorite_cards));
+  saved.delete(String(slug || "").trim().toLowerCase());
+  u.favorite_cards = Array.from(saved);
+  await DB.setUser(key, u);
+  return u.favorite_cards;
+}
+
+async function getFavoriteCards(email) {
+  const u = await getOrCreateUser(email);
+  return normalizeFavoriteCards(u?.favorite_cards);
 }
 
 async function rotateSingleSession(email) {
@@ -534,7 +587,10 @@ app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async
         // 2) Subscription / lifetime plans (SUB SKUs)
         else if (sku && SUB_SKUS[sku]) {
           const planCfg = SUB_SKUS[sku];
-          await setPlan(key, planCfg.plan);
+          const u2 = await setPlan(key, planCfg.plan);
+          u2.subscription_status = "active";
+          if (sku === "lifetime") u2.renews_at = null;
+          await DB.setUser(key, u2);
           console.log(`⭐ Plan '${planCfg.plan}' activated via checkout for ${key}`);
         }
         // 3) Legacy single PRO checkout (no SKU)
@@ -554,6 +610,8 @@ app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async
           const u = await getOrCreateUser(emailKey);
           const st = sub.status;
           u.pro = st === "active" || st === "trialing" || st === "past_due";
+          u.subscription_status = st || "none";
+          u.renews_at = sub.current_period_end ? new Date(sub.current_period_end * 1000).toISOString() : null;
           await DB.setUser(emailKey, u);
           console.log(`🔁 PRO ${u.pro ? "ON" : "OFF"} (subscription.updated)`, emailKey, st);
         }
@@ -566,6 +624,8 @@ app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async
         if (emailKey) {
           const u = await getOrCreateUser(emailKey);
           u.pro = false;
+          u.subscription_status = sub.status || "canceled";
+          u.renews_at = null;
           await DB.setUser(emailKey, u);
           console.log("🛑 PRO OFF (subscription.deleted)", emailKey);
         }
@@ -794,8 +854,11 @@ app.get("/api/me", async (req, res) => {
     email,
     pro: !!u.pro,
     plan: u.plan || null,
+    subscription_status: u.subscription_status || (u.pro ? "active" : "none"),
+    renews_at: u.renews_at || null,
     tickets: Number(u.tickets || 0),
-    owned_cards: normalizeOwnedCards(u.owned_cards)
+    owned_cards: normalizeOwnedCards(u.owned_cards),
+    favorite_cards: normalizeFavoriteCards(u.favorite_cards)
   });
 });
 
@@ -830,15 +893,41 @@ app.get("/api/wallet", requireAuth, async (req, res) => {
 
 app.get("/api/me/library", requireAuth, async (req, res) => {
   try {
-    const owned = await getOwnedCards(req.userEmail);
+    const favorites = await getFavoriteCards(req.userEmail);
     res.json({
       ok: true,
       email: req.userEmail,
-      owned_cards: owned,
+      favorite_cards: favorites,
       demo_cards: Object.values(CARD_CATALOG).filter((card) => card.free).map((card) => card.slug)
     });
   } catch (e) {
     console.error("library get error", e);
+    res.status(500).json({ ok: false, error: "library_failed" });
+  }
+});
+
+app.post("/api/me/library", requireAuth, async (req, res) => {
+  try {
+    const slug = String(req.body?.slug || "").trim().toLowerCase();
+    const action = String(req.body?.action || "add").trim().toLowerCase();
+    if (!CARD_CATALOG[slug]) {
+      return res.status(400).json({ ok: false, error: "invalid_theme" });
+    }
+
+    const u = await getOrCreateUser(req.userEmail);
+    let favoriteCards = [];
+    if (action === "remove") {
+      favoriteCards = await removeFavoriteCard(req.userEmail, slug);
+    } else {
+      if (!u.pro) {
+        return res.status(402).json({ ok: false, error: "subscription_required" });
+      }
+      favoriteCards = await addFavoriteCard(req.userEmail, slug);
+    }
+
+    return res.json({ ok: true, favorite_cards: favoriteCards });
+  } catch (e) {
+    console.error("library update error", e);
     res.status(500).json({ ok: false, error: "library_failed" });
   }
 });
@@ -1137,8 +1226,8 @@ app.post("/api/stripe/subscribe", requireAuth, async (req, res) => {
         email: req.userEmail,
         sku
       },
-      success_url: `${FRONTEND_BASE_URL}/?pro=success`,
-      cancel_url: `${FRONTEND_BASE_URL}/?pro=cancel`
+      success_url: `${FRONTEND_BASE_URL}/beta.html?subscribe=success`,
+      cancel_url: `${FRONTEND_BASE_URL}/beta.html?subscribe=cancel`
     });
 
     await DB.setPending(session.id, req.userEmail);
@@ -1251,13 +1340,16 @@ app.post("/api/stripe/refresh-pro", requireAuth, async (req, res) => {
       ["active", "trialing", "past_due"].includes(sub.status);
 
     u.pro = active;
+    u.subscription_status = sub?.status || "none";
+    u.renews_at = sub?.current_period_end ? new Date(sub.current_period_end * 1000).toISOString() : null;
     await DB.setUser(key, u);
 
     return res.json({
       ok: true,
       updated: true,
       pro: u.pro,
-      status: sub?.status || "none"
+      status: sub?.status || "none",
+      renews_at: u.renews_at
     });
   } catch (e) {
     console.error("refresh-pro error:", e);
