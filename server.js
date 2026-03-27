@@ -121,6 +121,11 @@ const DB = {
     if (fromRedis) return fromRedis;
     return mem.C2E.get(cusId) || null;
   },
+  async unmapCustomer(cusId) {
+    if (!cusId) return;
+    const deleted = await redisDelSafe(`C2E:${cusId}`);
+    if (!deleted) mem.C2E.delete(cusId);
+  },
 
   // OTP (5 min TTL)
   async setOTP(email, code, ttlSec = 300) {
@@ -213,9 +218,11 @@ const CARD_CATALOG = {
   grinch: { slug: "grinch", name: "Grinch Bingo", priceCents: 399, priceDisplay: "$3.99", free: false },
   luxuriousfashion: { slug: "luxuriousfashion", name: "Luxurious Fashion", priceCents: 499, priceDisplay: "$4.99", free: false },
   louisvuitton: { slug: "louisvuitton", name: "Louis Vuitton", priceCents: 499, priceDisplay: "$4.99", free: false },
-  cheech: { slug: "cheech", name: "Cheech & Chong", priceCents: 499, priceDisplay: "$4.99", free: false },
+  cheech: { slug: "cheech", name: "Up In Smoke", priceCents: 499, priceDisplay: "$4.99", free: false },
   titanic: { slug: "titanic", name: "Titanic", priceCents: 499, priceDisplay: "$4.99", free: false }
 };
+
+const FREE_DEMO_SLUGS = new Set(["breakfast", "puppy"]);
 
 function normalizeOwnedCards(input) {
   const raw = Array.isArray(input) ? input : [];
@@ -290,6 +297,56 @@ async function getOrCreateUser(email) {
   applyWhitelistedSubscriberOverride(key, u);
   await DB.setUser(key, u);
   return u;
+}
+
+function isMissingStripeCustomerError(err, customerId) {
+  return (
+    !!customerId &&
+    err?.code === "resource_missing" &&
+    (err?.param === "customer" ||
+      err?.resource === "customer" ||
+      String(err?.message || "").toLowerCase().includes("no such customer"))
+  );
+}
+
+async function clearStaleStripeCustomer(email, customerId, user) {
+  const key = (email || "").trim().toLowerCase();
+  if (!key || !customerId) return null;
+
+  const u = user || (await getOrCreateUser(key));
+  if (!u) return null;
+
+  if (u.stripe_customer === customerId) {
+    delete u.stripe_customer;
+  }
+  u.pro = false;
+  u.subscription_status = "none";
+  u.renews_at = null;
+
+  await DB.setUser(key, u);
+  await DB.unmapCustomer(customerId);
+
+  console.log(`Cleared stale Stripe customer for ${key}`);
+  return u;
+}
+
+async function getOrCreateStripeCustomer(email, user) {
+  const key = (email || "").trim().toLowerCase();
+  if (!key) return null;
+
+  const u = user || (await getOrCreateUser(key));
+  if (!u) return null;
+
+  if (u.stripe_customer) {
+    return { customerId: u.stripe_customer, user: u };
+  }
+
+  const customer = await stripe.customers.create({ email: key });
+  u.stripe_customer = customer.id;
+  await DB.setUser(key, u);
+  await DB.mapCustomer(customer.id, key);
+
+  return { customerId: customer.id, user: u };
 }
 
 async function getTickets(email) {
@@ -940,7 +997,7 @@ app.post("/api/me/library", requireAuth, async (req, res) => {
     if (action === "remove") {
       favoriteCards = await removeFavoriteCard(req.userEmail, slug);
     } else {
-      if (!u.pro) {
+      if (!u.pro && !FREE_DEMO_SLUGS.has(slug)) {
         return res.status(402).json({ ok: false, error: "subscription_required" });
       }
       favoriteCards = await addFavoriteCard(req.userEmail, slug);
@@ -1147,22 +1204,50 @@ app.post("/api/stripe/store-checkout", requireAuth, async (req, res) => {
       return res.status(400).json({ ok: false, error: "unknown_sku" });
     }
 
-    const session = await stripe.checkout.sessions.create({
-      mode: "payment",
-      customer_email: req.userEmail,
-      line_items: [
-        {
-          price: item.price,
-          quantity: 1
-        }
-      ],
-      metadata: {
-        email: req.userEmail,
-        sku
-      },
-      success_url: `${FRONTEND_BASE_URL}/?store=success`,
-      cancel_url: `${FRONTEND_BASE_URL}/?store=cancel`
-    });
+    const { customerId } = await getOrCreateStripeCustomer(req.userEmail);
+
+    let session;
+    try {
+      session = await stripe.checkout.sessions.create({
+        mode: "payment",
+        customer: customerId,
+        line_items: [
+          {
+            price: item.price,
+            quantity: 1
+          }
+        ],
+        metadata: {
+          email: req.userEmail,
+          sku
+        },
+        success_url: `${FRONTEND_BASE_URL}/?store=success`,
+        cancel_url: `${FRONTEND_BASE_URL}/?store=cancel`
+      });
+    } catch (e) {
+      if (isMissingStripeCustomerError(e, customerId)) {
+        await clearStaleStripeCustomer(req.userEmail, customerId);
+        const fresh = await getOrCreateStripeCustomer(req.userEmail);
+        session = await stripe.checkout.sessions.create({
+          mode: "payment",
+          customer: fresh.customerId,
+          line_items: [
+            {
+              price: item.price,
+              quantity: 1
+            }
+          ],
+          metadata: {
+            email: req.userEmail,
+            sku
+          },
+          success_url: `${FRONTEND_BASE_URL}/?store=success`,
+          cancel_url: `${FRONTEND_BASE_URL}/?store=cancel`
+        });
+      } else {
+        throw e;
+      }
+    }
 
     await DB.setPending(session.id, req.userEmail);
     res.json({ ok: true, url: session.url });
@@ -1201,19 +1286,44 @@ app.post("/api/stripe/cards-checkout", requireAuth, async (req, res) => {
       };
     });
 
-    const session = await stripe.checkout.sessions.create({
-      mode: "payment",
-      customer_email: req.userEmail,
-      allow_promotion_codes: true,
-      line_items,
-      metadata: {
-        email: req.userEmail,
-        kind: "cards",
-        cards: checkoutCards.join(",")
-      },
-      success_url: `${FRONTEND_BASE_URL}/beta.html?checkout=success`,
-      cancel_url: `${FRONTEND_BASE_URL}/beta.html?checkout=cancel`
-    });
+    const { customerId } = await getOrCreateStripeCustomer(req.userEmail);
+
+    let session;
+    try {
+      session = await stripe.checkout.sessions.create({
+        mode: "payment",
+        customer: customerId,
+        allow_promotion_codes: true,
+        line_items,
+        metadata: {
+          email: req.userEmail,
+          kind: "cards",
+          cards: checkoutCards.join(",")
+        },
+        success_url: `${FRONTEND_BASE_URL}/beta.html?checkout=success`,
+        cancel_url: `${FRONTEND_BASE_URL}/beta.html?checkout=cancel`
+      });
+    } catch (e) {
+      if (isMissingStripeCustomerError(e, customerId)) {
+        await clearStaleStripeCustomer(req.userEmail, customerId);
+        const fresh = await getOrCreateStripeCustomer(req.userEmail);
+        session = await stripe.checkout.sessions.create({
+          mode: "payment",
+          customer: fresh.customerId,
+          allow_promotion_codes: true,
+          line_items,
+          metadata: {
+            email: req.userEmail,
+            kind: "cards",
+            cards: checkoutCards.join(",")
+          },
+          success_url: `${FRONTEND_BASE_URL}/beta.html?checkout=success`,
+          cancel_url: `${FRONTEND_BASE_URL}/beta.html?checkout=cancel`
+        });
+      } else {
+        throw e;
+      }
+    }
 
     await DB.setPending(session.id, req.userEmail);
     res.json({ ok: true, url: session.url, cards: checkoutCards });
@@ -1234,22 +1344,50 @@ app.post("/api/stripe/subscribe", requireAuth, async (req, res) => {
 
     const isLifetime = sku === "lifetime";
 
-    const session = await stripe.checkout.sessions.create({
-      mode: isLifetime ? "payment" : "subscription",
-      customer_email: req.userEmail,
-      line_items: [
-        {
-          price: sub.price,
-          quantity: 1
-        }
-      ],
-      metadata: {
-        email: req.userEmail,
-        sku
-      },
-      success_url: `${FRONTEND_BASE_URL}/beta.html?subscribe=success`,
-      cancel_url: `${FRONTEND_BASE_URL}/beta.html?subscribe=cancel`
-    });
+    const { customerId } = await getOrCreateStripeCustomer(req.userEmail);
+
+    let session;
+    try {
+      session = await stripe.checkout.sessions.create({
+        mode: isLifetime ? "payment" : "subscription",
+        customer: customerId,
+        line_items: [
+          {
+            price: sub.price,
+            quantity: 1
+          }
+        ],
+        metadata: {
+          email: req.userEmail,
+          sku
+        },
+        success_url: `${FRONTEND_BASE_URL}/beta.html?subscribe=success`,
+        cancel_url: `${FRONTEND_BASE_URL}/beta.html?subscribe=cancel`
+      });
+    } catch (e) {
+      if (isMissingStripeCustomerError(e, customerId)) {
+        await clearStaleStripeCustomer(req.userEmail, customerId);
+        const fresh = await getOrCreateStripeCustomer(req.userEmail);
+        session = await stripe.checkout.sessions.create({
+          mode: isLifetime ? "payment" : "subscription",
+          customer: fresh.customerId,
+          line_items: [
+            {
+              price: sub.price,
+              quantity: 1
+            }
+          ],
+          metadata: {
+            email: req.userEmail,
+            sku
+          },
+          success_url: `${FRONTEND_BASE_URL}/beta.html?subscribe=success`,
+          cancel_url: `${FRONTEND_BASE_URL}/beta.html?subscribe=cancel`
+        });
+      } else {
+        throw e;
+      }
+    }
 
     await DB.setPending(session.id, req.userEmail);
     res.json({ ok: true, url: session.url });
@@ -1271,33 +1409,68 @@ app.post("/api/stripe/create-checkout", async (req, res) => {
       return res.status(400).json({ ok: false, error: "unauthenticated" });
     }
 
-    await getOrCreateUser(email);
+    const { customerId } = await getOrCreateStripeCustomer(email);
 
-    const session = await stripe.checkout.sessions.create({
-      mode: "subscription",
-      payment_method_types: ["card"],
-      customer_email: email,
-      allow_promotion_codes: true,
-      line_items: [
-        {
-          price_data: {
-            currency: "cad",
-            product_data: {
-              name: "BingoCardGen PRO",
-              description:
-                "Unlimited themes, multipliers, ad-free printing, and batch tools. Billed monthly in Canadian dollars (CA$10.99).",
-              images: ["https://bingocardgen.com/assets/logo-mini.png"]
+    let session;
+    try {
+      session = await stripe.checkout.sessions.create({
+        mode: "subscription",
+        payment_method_types: ["card"],
+        customer: customerId,
+        allow_promotion_codes: true,
+        line_items: [
+          {
+            price_data: {
+              currency: "cad",
+              product_data: {
+                name: "BingoCardGen PRO",
+                description:
+                  "Unlimited themes, multipliers, ad-free printing, and batch tools. Billed monthly in Canadian dollars (CA$10.99).",
+                images: ["https://bingocardgen.com/assets/logo-mini.png"]
+              },
+              unit_amount: 1099,
+              recurring: { interval: "month" }
             },
-            unit_amount: 1099,
-            recurring: { interval: "month" }
-          },
-          quantity: 1
-        }
-      ],
-      success_url: `${FRONTEND_BASE_URL}/?pro=success&sid={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${FRONTEND_BASE_URL}/?pro=cancel&sid={CHECKOUT_SESSION_ID}`,
-      metadata: { email }
-    });
+            quantity: 1
+          }
+        ],
+        success_url: `${FRONTEND_BASE_URL}/?pro=success&sid={CHECKOUT_SESSION_ID}`,
+        cancel_url: `${FRONTEND_BASE_URL}/?pro=cancel&sid={CHECKOUT_SESSION_ID}`,
+        metadata: { email }
+      });
+    } catch (e) {
+      if (isMissingStripeCustomerError(e, customerId)) {
+        await clearStaleStripeCustomer(email, customerId);
+        const fresh = await getOrCreateStripeCustomer(email);
+        session = await stripe.checkout.sessions.create({
+          mode: "subscription",
+          payment_method_types: ["card"],
+          customer: fresh.customerId,
+          allow_promotion_codes: true,
+          line_items: [
+            {
+              price_data: {
+                currency: "cad",
+                product_data: {
+                  name: "BingoCardGen PRO",
+                  description:
+                    "Unlimited themes, multipliers, ad-free printing, and batch tools. Billed monthly in Canadian dollars (CA$10.99).",
+                  images: ["https://bingocardgen.com/assets/logo-mini.png"]
+                },
+                unit_amount: 1099,
+                recurring: { interval: "month" }
+              },
+              quantity: 1
+            }
+          ],
+          success_url: `${FRONTEND_BASE_URL}/?pro=success&sid={CHECKOUT_SESSION_ID}`,
+          cancel_url: `${FRONTEND_BASE_URL}/?pro=cancel&sid={CHECKOUT_SESSION_ID}`,
+          metadata: { email }
+        });
+      } else {
+        throw e;
+      }
+    }
 
     await DB.setPending(session.id, email);
 
@@ -1323,10 +1496,19 @@ app.post("/api/stripe/portal", async (req, res) => {
       return res.status(400).json({ ok: false, error: "no_customer" });
     }
 
-    const portal = await stripe.billingPortal.sessions.create({
-      customer: u.stripe_customer,
-      return_url: FRONTEND_BASE_URL
-    });
+    let portal;
+    try {
+      portal = await stripe.billingPortal.sessions.create({
+        customer: u.stripe_customer,
+        return_url: FRONTEND_BASE_URL
+      });
+    } catch (e) {
+      if (isMissingStripeCustomerError(e, u.stripe_customer)) {
+        await clearStaleStripeCustomer(email, u.stripe_customer, u);
+        return res.status(400).json({ ok: false, error: "no_customer" });
+      }
+      throw e;
+    }
 
     return res.json({ ok: true, url: portal.url });
   } catch (e) {
@@ -1349,11 +1531,26 @@ app.post("/api/stripe/refresh-pro", requireAuth, async (req, res) => {
       });
     }
 
-    const subs = await stripe.subscriptions.list({
-      customer: u.stripe_customer,
-      status: "all",
-      limit: 1
-    });
+    let subs;
+    try {
+      subs = await stripe.subscriptions.list({
+        customer: u.stripe_customer,
+        status: "all",
+        limit: 1
+      });
+    } catch (e) {
+      if (isMissingStripeCustomerError(e, u.stripe_customer)) {
+        const cleared = await clearStaleStripeCustomer(key, u.stripe_customer, u);
+        return res.json({
+          ok: true,
+          updated: true,
+          pro: false,
+          status: cleared?.subscription_status || "none",
+          renews_at: null
+        });
+      }
+      throw e;
+    }
 
     const sub = subs.data[0];
     const active =
