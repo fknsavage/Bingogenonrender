@@ -1198,51 +1198,55 @@ if (ENABLE_TEST_ROUTES) {
 // ---------- Stripe: Store ticket packs ----------
 app.post("/api/stripe/store-checkout", requireAuth, async (req, res) => {
   try {
-    const { sku } = req.body || {};
-    const item = STORE_SKUS[sku];
-    if (!item || !item.price) {
-      return res.status(400).json({ ok: false, error: "unknown_sku" });
+    if (!req.user?.pro) {
+      return res.status(402).json({ ok: false, error: "subscription_required" });
+    }
+
+    const items = Array.isArray(req.body?.items) ? req.body.items : [];
+    if (!items.length) {
+      return res.status(400).json({ ok: false, error: "no_items" });
+    }
+
+    const themePackPriceId = String(process.env.STRIPE_THEME_PACK_PRICE_ID || "").trim();
+    if (!themePackPriceId) {
+      console.error("store checkout missing STRIPE_THEME_PACK_PRICE_ID");
+      return res.status(500).json({ ok: false, error: "checkout_failed" });
+    }
+
+    const packIds = items.map((item) => String(item?.packId || "").trim());
+    if (packIds.some((packId) => !packId)) {
+      return res.status(400).json({ ok: false, error: "invalid_items" });
     }
 
     const { customerId } = await getOrCreateStripeCustomer(req.userEmail);
 
+    const sessionPayload = {
+      mode: "payment",
+      customer: customerId,
+      line_items: [
+        {
+          price: themePackPriceId,
+          quantity: packIds.length
+        }
+      ],
+      metadata: {
+        email: req.userEmail,
+        packs: packIds.join(",")
+      },
+      success_url: "https://bingocardgen.com/beta.html?purchase=success",
+      cancel_url: "https://bingocardgen.com/beta.html?purchase=cancelled"
+    };
+
     let session;
     try {
-      session = await stripe.checkout.sessions.create({
-        mode: "payment",
-        customer: customerId,
-        line_items: [
-          {
-            price: item.price,
-            quantity: 1
-          }
-        ],
-        metadata: {
-          email: req.userEmail,
-          sku
-        },
-        success_url: `${FRONTEND_BASE_URL}/?store=success`,
-        cancel_url: `${FRONTEND_BASE_URL}/?store=cancel`
-      });
+      session = await stripe.checkout.sessions.create(sessionPayload);
     } catch (e) {
       if (isMissingStripeCustomerError(e, customerId)) {
         await clearStaleStripeCustomer(req.userEmail, customerId);
         const fresh = await getOrCreateStripeCustomer(req.userEmail);
         session = await stripe.checkout.sessions.create({
-          mode: "payment",
-          customer: fresh.customerId,
-          line_items: [
-            {
-              price: item.price,
-              quantity: 1
-            }
-          ],
-          metadata: {
-            email: req.userEmail,
-            sku
-          },
-          success_url: `${FRONTEND_BASE_URL}/?store=success`,
-          cancel_url: `${FRONTEND_BASE_URL}/?store=cancel`
+          ...sessionPayload,
+          customer: fresh.customerId
         });
       } else {
         throw e;
@@ -1250,7 +1254,7 @@ app.post("/api/stripe/store-checkout", requireAuth, async (req, res) => {
     }
 
     await DB.setPending(session.id, req.userEmail);
-    res.json({ ok: true, url: session.url });
+    res.json({ url: session.url });
   } catch (e) {
     console.error("store checkout error", e);
     res.status(500).json({ ok: false, error: "checkout_failed" });
