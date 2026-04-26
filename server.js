@@ -721,6 +721,10 @@ app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async
   }
 });
 
+app.get("/api/health", (_req, res) => {
+  res.status(200).json({ status: "ok" });
+});
+
 // JSON parser for all other routes (must come after raw webhook)
 app.use(express.json());
 
@@ -806,10 +810,6 @@ app.post("/api/contact", async (req, res) => {
     return res.status(500).json({ ok: false, error: "server_error" });
   }
 });
-
-app.get("/api/health", (_req, res) =>
-  res.json({ ok: true, redis: !!redis, time: new Date().toISOString() })
-);
 
 // start OTP (with anti-double-send throttle)
 app.post("/api/auth/otp/start", async (req, res) => {
