@@ -82,6 +82,7 @@ function applyWhitelistedSubscriberOverride(email, user) {
   user.pro = true;
   user.subscription_status = "active";
   user.renews_at = null;
+  user.trial_ends_at = null;
   return user;
 }
 
@@ -281,6 +282,7 @@ async function getOrCreateUser(email) {
       favorite_cards: [],
       subscription_status: "none",
       renews_at: null,
+      trial_ends_at: null,
       current_sid: null
     };
   } else {
@@ -291,6 +293,7 @@ async function getOrCreateUser(email) {
     u.favorite_cards = normalizeFavoriteCards(u.favorite_cards);
     if (!("subscription_status" in u)) u.subscription_status = u.pro ? "active" : "none";
     if (!("renews_at" in u)) u.renews_at = null;
+    if (!("trial_ends_at" in u)) u.trial_ends_at = null;
     if (!("current_sid" in u)) u.current_sid = null;
   }
 
@@ -322,6 +325,7 @@ async function clearStaleStripeCustomer(email, customerId, user) {
   u.pro = false;
   u.subscription_status = "none";
   u.renews_at = null;
+  u.trial_ends_at = null;
 
   await DB.setUser(key, u);
   await DB.unmapCustomer(customerId);
@@ -347,6 +351,20 @@ async function getOrCreateStripeCustomer(email, user) {
   await DB.mapCustomer(customer.id, key);
 
   return { customerId: customer.id, user: u };
+}
+
+function applyStripeSubscriptionState(user, subscription) {
+  if (!user) return user;
+
+  const status = subscription?.status || "none";
+  user.pro = ["active", "trialing", "past_due"].includes(status);
+  user.subscription_status = status;
+  user.renews_at = subscription?.current_period_end
+    ? new Date(subscription.current_period_end * 1000).toISOString()
+    : null;
+  user.trial_ends_at = subscription?.trial_end || null;
+
+  return user;
 }
 
 async function getTickets(email) {
@@ -624,6 +642,10 @@ app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async
         const sku = metadata.sku || null;
         const checkoutKind = metadata.kind || "legacy";
         const cardSlugs = normalizeCardSelection(String(metadata.cards || "").split(","));
+        const stripeSubscriptionId = typeof s.subscription === "string" ? s.subscription : s.subscription?.id || null;
+        const stripeSubscription = stripeSubscriptionId
+          ? await stripe.subscriptions.retrieve(stripeSubscriptionId)
+          : null;
 
         let email =
           (s.customer_details && s.customer_details.email) ||
@@ -666,14 +688,30 @@ app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async
         else if (sku && SUB_SKUS[sku]) {
           const planCfg = SUB_SKUS[sku];
           const u2 = await setPlan(key, planCfg.plan);
-          u2.subscription_status = "active";
-          if (sku === "lifetime") u2.renews_at = null;
+          if (stripeSubscription) {
+            applyStripeSubscriptionState(u2, stripeSubscription);
+          } else {
+            u2.subscription_status = "active";
+            u2.renews_at = null;
+            u2.trial_ends_at = null;
+          }
+          if (sku === "lifetime") {
+            u2.renews_at = null;
+            u2.trial_ends_at = null;
+          }
           await DB.setUser(key, u2);
           console.log(`⭐ Plan '${planCfg.plan}' activated via checkout for ${key}`);
         }
         // 3) Legacy single PRO checkout (no SKU)
         else {
-          u.pro = true;
+          if (stripeSubscription) {
+            applyStripeSubscriptionState(u, stripeSubscription);
+          } else {
+            u.pro = true;
+            u.subscription_status = "active";
+            u.renews_at = null;
+            u.trial_ends_at = null;
+          }
           await DB.setUser(key, u);
           console.log("✅ Legacy PRO ON via checkout:", key, customerId || "");
         }
@@ -687,9 +725,7 @@ app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async
         if (emailKey) {
           const u = await getOrCreateUser(emailKey);
           const st = sub.status;
-          u.pro = st === "active" || st === "trialing" || st === "past_due";
-          u.subscription_status = st || "none";
-          u.renews_at = sub.current_period_end ? new Date(sub.current_period_end * 1000).toISOString() : null;
+          applyStripeSubscriptionState(u, sub);
           await DB.setUser(emailKey, u);
           console.log(`🔁 PRO ${u.pro ? "ON" : "OFF"} (subscription.updated)`, emailKey, st);
         }
@@ -704,11 +740,15 @@ app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async
           u.pro = false;
           u.subscription_status = sub.status || "canceled";
           u.renews_at = null;
+          u.trial_ends_at = null;
           await DB.setUser(emailKey, u);
           console.log("🛑 PRO OFF (subscription.deleted)", emailKey);
         }
         break;
       }
+
+      case "customer.subscription.trial_will_end":
+        break;
 
       default:
         break;
@@ -933,6 +973,8 @@ app.get("/api/me", async (req, res) => {
     pro: !!u.pro,
     plan: u.plan || null,
     subscription_status: u.subscription_status || (u.pro ? "active" : "none"),
+    onTrial: (u.subscription_status || "") === "trialing",
+    trialEndsAt: (u.subscription_status || "") === "trialing" ? (u.trial_ends_at || null) : null,
     renews_at: u.renews_at || null,
     tickets: Number(u.tickets || 0),
     owned_cards: normalizeOwnedCards(u.owned_cards),
@@ -1365,6 +1407,7 @@ app.post("/api/stripe/subscribe", requireAuth, async (req, res) => {
           email: req.userEmail,
           sku
         },
+        ...(isLifetime ? {} : { subscription_data: { trial_period_days: 7 } }),
         success_url: `${FRONTEND_BASE_URL}/beta.html?subscribe=success`,
         cancel_url: `${FRONTEND_BASE_URL}/beta.html?subscribe=cancel`
       });
@@ -1385,6 +1428,7 @@ app.post("/api/stripe/subscribe", requireAuth, async (req, res) => {
             email: req.userEmail,
             sku
           },
+          ...(isLifetime ? {} : { subscription_data: { trial_period_days: 7 } }),
           success_url: `${FRONTEND_BASE_URL}/beta.html?subscribe=success`,
           cancel_url: `${FRONTEND_BASE_URL}/beta.html?subscribe=cancel`
         });
@@ -1422,6 +1466,9 @@ app.post("/api/stripe/create-checkout", async (req, res) => {
         payment_method_types: ["card"],
         customer: customerId,
         allow_promotion_codes: true,
+        subscription_data: {
+          trial_period_days: 7
+        },
         line_items: [
           {
             price_data: {
@@ -1451,6 +1498,9 @@ app.post("/api/stripe/create-checkout", async (req, res) => {
           payment_method_types: ["card"],
           customer: fresh.customerId,
           allow_promotion_codes: true,
+          subscription_data: {
+            trial_period_days: 7
+          },
           line_items: [
             {
               price_data: {
@@ -1531,7 +1581,9 @@ app.post("/api/stripe/refresh-pro", requireAuth, async (req, res) => {
       return res.json({
         ok: true,
         updated: false,
-        pro: !!u?.pro
+        pro: !!u?.pro,
+        onTrial: false,
+        trialEndsAt: null
       });
     }
 
@@ -1550,6 +1602,8 @@ app.post("/api/stripe/refresh-pro", requireAuth, async (req, res) => {
           updated: true,
           pro: false,
           status: cleared?.subscription_status || "none",
+          onTrial: false,
+          trialEndsAt: null,
           renews_at: null
         });
       }
@@ -1557,13 +1611,7 @@ app.post("/api/stripe/refresh-pro", requireAuth, async (req, res) => {
     }
 
     const sub = subs.data[0];
-    const active =
-      !!sub &&
-      ["active", "trialing", "past_due"].includes(sub.status);
-
-    u.pro = active;
-    u.subscription_status = sub?.status || "none";
-    u.renews_at = sub?.current_period_end ? new Date(sub.current_period_end * 1000).toISOString() : null;
+    applyStripeSubscriptionState(u, sub);
     await DB.setUser(key, u);
 
     return res.json({
@@ -1571,6 +1619,8 @@ app.post("/api/stripe/refresh-pro", requireAuth, async (req, res) => {
       updated: true,
       pro: u.pro,
       status: sub?.status || "none",
+      onTrial: u.subscription_status === "trialing",
+      trialEndsAt: u.subscription_status === "trialing" ? (u.trial_ends_at || null) : null,
       renews_at: u.renews_at
     });
   } catch (e) {
