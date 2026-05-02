@@ -453,6 +453,36 @@ async function getOwnedCards(email) {
   return normalizeOwnedCards(u?.owned_cards);
 }
 
+function normalizeOwnedPacks(input) {
+  if (!Array.isArray(input)) return [];
+  const seen = new Set();
+  const out = [];
+  for (const item of input) {
+    const slug = String(item || "").trim().toLowerCase();
+    if (!slug || seen.has(slug)) continue;
+    if (!THEME_PACKS[slug]) continue;
+    seen.add(slug);
+    out.push(slug);
+  }
+  return out;
+}
+
+async function getOwnedPacks(emailKey) {
+  if (!emailKey) return [];
+  const u = await getOrCreateUser(emailKey);
+  return normalizeOwnedPacks(u.owned_packs);
+}
+
+async function addOwnedPacks(emailKey, packSlugs) {
+  const incoming = normalizeOwnedPacks(packSlugs);
+  if (!emailKey || !incoming.length) return await getOwnedPacks(emailKey);
+  const u = await getOrCreateUser(emailKey);
+  const merged = new Set([...(normalizeOwnedPacks(u.owned_packs)), ...incoming]);
+  u.owned_packs = Array.from(merged);
+  await DB.setUser(emailKey, u);
+  return u.owned_packs;
+}
+
 async function addFavoriteCard(email, slug) {
   const key = (email || "").toLowerCase();
   const theme = normalizeFavoriteCards([slug]);
@@ -529,6 +559,13 @@ const SUB_SKUS = {
   "lifetime": {
     price: process.env.STRIPE_PRICE_LIFETIME,
     plan: "lifetime"
+  }
+};
+
+const THEME_PACKS = {
+  "toon-vault-collection": {
+    name: "Toon Vault Collection",
+    priceCents: 4000
   }
 };
 
@@ -669,11 +706,21 @@ app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async
           await DB.mapCustomer(customerId, key);
         }
 
-        // 1) Ticket packs (STORE SKUs)
-        if (checkoutKind === "cards" && cardSlugs.length) {
+        // 0) Theme pack purchases (forever-unlock paid packs)
+        if (checkoutKind === "theme_pack") {
+          const packSlug = String(metadata.pack || "").trim().toLowerCase();
+          if (packSlug && THEME_PACKS[packSlug]) {
+            const ownedPacks = await addOwnedPacks(key, [packSlug]);
+            console.log(`📦 Theme pack "${packSlug}" unlocked for ${key}, owned: ${ownedPacks.join(", ")}`);
+          } else {
+            console.warn(`theme_pack webhook with invalid pack slug: ${packSlug}`);
+          }
+        }
+        else if (checkoutKind === "cards" && cardSlugs.length) {
           const ownedCards = await addOwnedCards(key, cardSlugs);
           console.log(`🃏 Card checkout completed for ${key}:`, ownedCards.join(", "));
         }
+        // 1) Ticket packs (STORE SKUs)
         else if (sku && STORE_SKUS[sku]) {
           const pack = STORE_SKUS[sku];
           const added = Number(pack.tickets || 0);
@@ -967,6 +1014,12 @@ app.get("/api/me", async (req, res) => {
     if (sid) await DB.delSession(sid);
     return res.json({ authed: false });
   }
+  const isAdminWhitelist = ADMIN_SUBSCRIBER_WHITELIST.includes(email.toLowerCase());
+  const persistedPacks = normalizeOwnedPacks(u.owned_packs);
+  const effectivePacks = isAdminWhitelist
+    ? Array.from(new Set([...persistedPacks, ...Object.keys(THEME_PACKS)]))
+    : persistedPacks;
+
   res.json({
     authed: true,
     email,
@@ -978,6 +1031,7 @@ app.get("/api/me", async (req, res) => {
     renews_at: u.renews_at || null,
     tickets: Number(u.tickets || 0),
     owned_cards: normalizeOwnedCards(u.owned_cards),
+    owned_packs: effectivePacks,
     favorite_cards: normalizeFavoriteCards(u.favorite_cards)
   });
 });
@@ -1299,6 +1353,74 @@ app.post("/api/stripe/store-checkout", requireAuth, async (req, res) => {
     res.json({ url: session.url });
   } catch (e) {
     console.error("store checkout error", e);
+    res.status(500).json({ ok: false, error: "checkout_failed" });
+  }
+});
+
+app.post("/api/stripe/pack-checkout", requireAuth, async (req, res) => {
+  try {
+    if (!req.user?.pro) {
+      return res.status(402).json({ ok: false, error: "subscription_required" });
+    }
+
+    const packSlug = String(req.body?.packSlug || "").trim().toLowerCase();
+    if (!packSlug || !THEME_PACKS[packSlug]) {
+      return res.status(400).json({ ok: false, error: "invalid_pack" });
+    }
+
+    const universalPriceId = String(process.env.STRIPE_THEME_PACK_PRICE_ID || "").trim();
+    if (!universalPriceId) {
+      console.error("pack-checkout missing STRIPE_THEME_PACK_PRICE_ID");
+      return res.status(500).json({ ok: false, error: "checkout_unavailable" });
+    }
+
+    const isAdminWhitelist = ADMIN_SUBSCRIBER_WHITELIST.includes(req.userEmail.toLowerCase());
+    const ownedPacks = await getOwnedPacks(req.userEmail);
+    if (isAdminWhitelist || ownedPacks.includes(packSlug)) {
+      return res.status(400).json({ ok: false, error: "already_owned" });
+    }
+
+    const { customerId } = await getOrCreateStripeCustomer(req.userEmail);
+
+    const sessionPayload = {
+      mode: "payment",
+      customer: customerId,
+      allow_promotion_codes: true,
+      line_items: [
+        {
+          price: universalPriceId,
+          quantity: 1
+        }
+      ],
+      metadata: {
+        email: req.userEmail,
+        kind: "theme_pack",
+        pack: packSlug
+      },
+      success_url: `${FRONTEND_BASE_URL}/beta.html?pack_purchase=success`,
+      cancel_url: `${FRONTEND_BASE_URL}/beta.html?pack_purchase=cancelled`
+    };
+
+    let session;
+    try {
+      session = await stripe.checkout.sessions.create(sessionPayload);
+    } catch (e) {
+      if (isMissingStripeCustomerError(e, customerId)) {
+        await clearStaleStripeCustomer(req.userEmail, customerId);
+        const fresh = await getOrCreateStripeCustomer(req.userEmail);
+        session = await stripe.checkout.sessions.create({
+          ...sessionPayload,
+          customer: fresh.customerId
+        });
+      } else {
+        throw e;
+      }
+    }
+
+    await DB.setPending(session.id, req.userEmail);
+    res.json({ url: session.url });
+  } catch (e) {
+    console.error("pack checkout error", e);
     res.status(500).json({ ok: false, error: "checkout_failed" });
   }
 });
